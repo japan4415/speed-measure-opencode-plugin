@@ -7,11 +7,16 @@ export default defineConfig({
   external: [
     "@opentui/solid",
     "@opentui/solid/store",
+    "@opentui/solid/jsx-runtime",
     "solid-js",
     "@opencode-ai/plugin",
     "@opencode-ai/sdk",
   ],
-  jsx: "preserve", // SolidJS JSX の変換を @opentui/solid ランタイムに委ねる
+  esbuildOptions(options) {
+    options.jsx = "automatic";
+    options.jsxImportSource = "@opentui/solid";
+  },
   target: "esnext",
   outDir: "dist",
 });
+

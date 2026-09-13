@@ -97,7 +97,7 @@ speed-measure-opencode-plugin/
 
 ビルドを採用する理由：モジュール分割でユニットテストが容易、TypeScript 型チェックで API シグネチャの誤りを事前検出、`dist/index.js` を npm package の `main` として公開できる。
 
-tsup 8.x のトップレベル `jsx: "preserve"` は `Options` 型に存在せず無効である。このため `esbuildOptions` 内で `options.jsx = "preserve"` を指定して単一ファイルへバンドルし、続けて `babel-preset-solid` を `moduleName: "@opentui/solid"`、`generate: "universal"` で実行する。この Babel 設定は `@opentui/solid@0.5.11` の `scripts/solid-transform.js` と同一である。
+tsup 8.x のトップレベル `jsx: "preserve"` は `Options` 型に存在せず無効である。このため `esbuildOptions` 内で `options.jsx = "preserve"` を指定し、`splitting: false` で `.tsup-out/index.js` へ単一ファイルとしてバンドルする。続けて `babel-preset-solid` を `moduleName: "@opentui/solid"`、`generate: "universal"` で実行し、変換に成功したコードだけを一時ファイルから `dist/index.js` へ rename する。この Babel 設定は `@opentui/solid@0.5.11` の `scripts/solid-transform.js` と同一である。中間出力と公開先を分離するため、Babel が失敗しても生 JSX を含む中間成果物が `dist/index.js` に残らず、直前の正常な配布物を保持できる。
 
 esbuild の automatic JSX 変換は採用しない。automatic では `<text>{value()}</text>` が `jsx("text", { children: value() })` となり、`value()` がランタイムの effect より先に評価されるため、シグナル依存が登録されずライブ表示が更新されない。Solid universal 変換後は、同じ子要素が `_$insert(_el$, value)`、動的 prop が `_$effect(... value() ...)` となり、読み取りがリアクティブスコープ内に保たれる。
 
@@ -111,11 +111,13 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: ["src/index.tsx"],
   format: ["esm"],
+  splitting: false,
+  clean: true,
   // OpenCode ランタイムが注入するので外部化（バンドルしない）
   external: [
     "@opentui/solid",
-    "@opentui/solid/store",
     "solid-js",
+    "solid-js/store",
     "@opencode-ai/plugin",
     "@opencode-ai/sdk",
   ],
@@ -127,7 +129,7 @@ export default defineConfig({
     };
   },
   target: "esnext",
-  outDir: "dist",
+  outDir: ".tsup-out",
 });
 ```
 
@@ -140,6 +142,7 @@ export default defineConfig({
   "type": "module",
   "main": "./dist/index.js",
   "exports": { ".": "./dist/index.js" },
+  "files": ["dist"],
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.15.0"
   },
@@ -155,6 +158,7 @@ export default defineConfig({
   },
   "scripts": {
     "build": "tsup && node scripts/transform-solid.mjs",
+    "prepack": "npm run build",
     "test":  "vitest run"
   }
 }

@@ -3,11 +3,13 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: ["src/index.tsx"],
   format: ["esm"],
+  splitting: false,
+  clean: true,
   // OpenCode ランタイムが注入するので外部化（バンドルしない）
   external: [
     "@opentui/solid",
-    "@opentui/solid/store",
     "solid-js",
+    "solid-js/store",
     "@opencode-ai/plugin",
     "@opencode-ai/sdk",
   ],
@@ -21,5 +23,5 @@ export default defineConfig({
     };
   },
   target: "esnext",
-  outDir: "dist",
+  outDir: ".tsup-out",
 });

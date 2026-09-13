@@ -1,0 +1,51 @@
+[
+  {
+    "id": "evt-simple-step-started",
+    "type": "session.next.step.started",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "timestamp": 1000,
+      "agent": "default",
+      "model": { "id": "deepseek-v4.1-flash", "providerID": "vllm" }
+    }
+  },
+  {
+    "id": "evt-simple-text-started",
+    "type": "session.next.text.started",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "textID": "text-1",
+      "timestamp": 1340
+    }
+  },
+  {
+    "id": "evt-simple-text-delta",
+    "type": "session.next.text.delta",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "textID": "text-1",
+      "timestamp": 1500,
+      "delta": "Hello from vLLM."
+    }
+  },
+  {
+    "id": "evt-simple-step-ended",
+    "type": "session.next.step.ended",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "timestamp": 2340,
+      "finish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 68,
+        "output": 40,
+        "reasoning": 0,
+        "cache": { "read": 0, "write": 0 }
+      }
+    }
+  }
+]

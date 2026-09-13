@@ -1,0 +1,47 @@
+[
+  {
+    "type": "step.started",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "timestamp": 1000,
+      "agent": "default",
+      "model": { "id": "deepseek-v4.1-flash" }
+    }
+  },
+  {
+    "type": "text.started",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "textID": "text-1",
+      "timestamp": 1340
+    }
+  },
+  {
+    "type": "text.delta",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "textID": "text-1",
+      "timestamp": 1500,
+      "delta": "Hello from vLLM."
+    }
+  },
+  {
+    "type": "step.ended",
+    "properties": {
+      "sessionID": "simple-session",
+      "assistantMessageID": "simple-message",
+      "timestamp": 2340,
+      "finish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 68,
+        "output": 40,
+        "reasoning": 0,
+        "cache": { "read": 0, "write": 0 }
+      }
+    }
+  }
+]

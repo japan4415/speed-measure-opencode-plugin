@@ -4,11 +4,7 @@ import type { Event } from "@opencode-ai/sdk/v2";
 import {
   SpeedCollector,
   type CollectorState,
-  type ReasoningDeltaProps,
-  type ReasoningStartedProps,
-  type StepEndedProps,
-  type TextDeltaProps,
-  type TextStartedProps,
+  type StepState,
 } from "../src/collector.js";
 import reasoningFixture from "./fixtures/reasoning.json";
 import simpleTextFixture from "./fixtures/simple-text.json";
@@ -34,7 +30,7 @@ const ev = {
   reasoningStarted: (
     timestamp: number,
     sessionID = "s1"
-  ): ReasoningStartedProps => ({
+  ): EventProperties<"session.next.reasoning.started"> => ({
     sessionID,
     assistantMessageID: "msg1",
     timestamp,
@@ -42,23 +38,33 @@ const ev = {
   }),
   reasoningDelta: (
     delta: string,
-    sessionID = "s1"
-  ): ReasoningDeltaProps => ({
+    sessionID = "s1",
+    timestamp = 1300
+  ): EventProperties<"session.next.reasoning.delta"> => ({
     sessionID,
     assistantMessageID: "msg1",
     reasoningID: "r1",
+    timestamp,
     delta,
   }),
-  textStarted: (timestamp: number, sessionID = "s1"): TextStartedProps => ({
+  textStarted: (
+    timestamp: number,
+    sessionID = "s1"
+  ): EventProperties<"session.next.text.started"> => ({
     sessionID,
     assistantMessageID: "msg1",
     timestamp,
     textID: "t1",
   }),
-  textDelta: (delta: string, sessionID = "s1"): TextDeltaProps => ({
+  textDelta: (
+    delta: string,
+    sessionID = "s1",
+    timestamp = 1300
+  ): EventProperties<"session.next.text.delta"> => ({
     sessionID,
     assistantMessageID: "msg1",
     textID: "t1",
+    timestamp,
     delta,
   }),
   stepEnded: (
@@ -67,7 +73,7 @@ const ev = {
     reasoning = 0,
     input = 100,
     sessionID = "s1"
-  ): StepEndedProps => ({
+  ): EventProperties<"session.next.step.ended"> => ({
     sessionID,
     assistantMessageID: "msg1",
     timestamp,
@@ -400,7 +406,421 @@ function expectPureCall(
   return result;
 }
 
+type RegisteredPhase = StepState["phase"];
+type MatrixPhase = RegisteredPhase | "unregistered";
+
+const registeredPhases: RegisteredPhase[] = [
+  "idle",
+  "prefilling",
+  "decoding",
+  "done",
+  "error",
+];
+const matrixPhases: MatrixPhase[] = ["unregistered", ...registeredPhases];
+
+function stateAtPhase(
+  phase: MatrixPhase,
+  sessionID = "target"
+): CollectorState {
+  if (phase === "unregistered") return new Map();
+
+  const current: StepState = (() => {
+    switch (phase) {
+      case "idle":
+        return { phase: "idle" };
+      case "prefilling":
+        return {
+          phase: "prefilling",
+          sessionID,
+          assistantMessageID: "msg1",
+          t0: 1000,
+        };
+      case "decoding":
+        return {
+          phase: "decoding",
+          sessionID,
+          assistantMessageID: "msg1",
+          t0: 1000,
+          t1: 1200,
+          ttft: 200,
+          liveChars: 5,
+          liveEstimate: null,
+        };
+      case "done":
+        return {
+          phase: "done",
+          sessionID,
+          ttft: 200,
+          prefillTokPerSec: 500,
+          decodeTokPerSec: 10,
+        };
+      case "error":
+        return { phase: "error", sessionID };
+    }
+  })();
+
+  return new Map([[sessionID, { current, stepHistory: [] }]]);
+}
+
+function currentPhase(state: CollectorState, sessionID = "target"):
+  | RegisteredPhase
+  | "unregistered" {
+  return state.get(sessionID)?.current.phase ?? "unregistered";
+}
+
+type HandlerMatrixCase = {
+  name: string;
+  expected: Record<MatrixPhase, MatrixPhase>;
+  invoke: (collector: SpeedCollector, state: CollectorState) => CollectorState;
+};
+
+const preserveAll: Record<MatrixPhase, MatrixPhase> = {
+  unregistered: "unregistered",
+  idle: "idle",
+  prefilling: "prefilling",
+  decoding: "decoding",
+  done: "done",
+  error: "error",
+};
+
+const handlerPhaseMatrix: HandlerMatrixCase[] = [
+  {
+    name: "onStepStarted",
+    expected: Object.fromEntries(
+      matrixPhases.map((phase) => [phase, "prefilling"])
+    ) as Record<MatrixPhase, MatrixPhase>,
+    invoke: (collector, state) =>
+      collector.onStepStarted(state, ev.stepStarted("target", 2000)),
+  },
+  {
+    name: "onReasoningStarted",
+    expected: { ...preserveAll, prefilling: "decoding" },
+    invoke: (collector, state) =>
+      collector.onReasoningStarted(state, ev.reasoningStarted(1250, "target")),
+  },
+  {
+    name: "onReasoningDelta",
+    expected: preserveAll,
+    invoke: (collector, state) =>
+      collector.onReasoningDelta(state, ev.reasoningDelta("abc", "target")),
+  },
+  {
+    name: "onTextStarted",
+    expected: { ...preserveAll, prefilling: "decoding" },
+    invoke: (collector, state) =>
+      collector.onTextStarted(state, ev.textStarted(1250, "target")),
+  },
+  {
+    name: "onTextDelta",
+    expected: preserveAll,
+    invoke: (collector, state) =>
+      collector.onTextDelta(state, ev.textDelta("abcd", "target")),
+  },
+  {
+    name: "onStepEnded",
+    expected: { ...preserveAll, prefilling: "idle", decoding: "done" },
+    invoke: (collector, state) =>
+      collector.onStepEnded(state, ev.stepEnded(2200, 10, 2, 100, "target")),
+  },
+  {
+    name: "onStepFailed",
+    expected: Object.fromEntries(
+      matrixPhases.map((phase) => [phase, "error"])
+    ) as Record<MatrixPhase, MatrixPhase>,
+    invoke: (collector, state) =>
+      collector.onStepFailed(state, ev.stepFailed("target")),
+  },
+  {
+    name: "onIdle",
+    expected: {
+      ...preserveAll,
+      prefilling: "idle",
+      decoding: "idle",
+    },
+    invoke: (collector, state) => collector.onIdle(state, "target"),
+  },
+  {
+    name: "onSessionError(scoped)",
+    expected: Object.fromEntries(
+      matrixPhases.map((phase) => [phase, "error"])
+    ) as Record<MatrixPhase, MatrixPhase>,
+    invoke: (collector, state) => collector.onSessionError(state, "target"),
+  },
+];
+
+const handlerPhaseCases = handlerPhaseMatrix.flatMap((handler) =>
+  matrixPhases.map((phase) => ({ handler, phase }))
+);
+
 describe("SpeedCollector", () => {
+  describe("handler × starting phase transition matrix", () => {
+    it.each(handlerPhaseCases)(
+      "$handler.name: $phase -> expected phase",
+      ({ handler, phase }) => {
+        const collector = new SpeedCollector();
+        const initial = stateAtPhase(phase);
+        const result = handler.invoke(collector, initial);
+
+        expect(currentPhase(result)).toBe(handler.expected[phase]);
+
+        const current = result.get("target")?.current;
+        if (handler.name === "onStepStarted") {
+          expect(current).toMatchObject({
+            phase: "prefilling",
+            sessionID: "target",
+            assistantMessageID: "msg1",
+            t0: 2000,
+          });
+        }
+        if (handler.name === "onReasoningStarted" && phase === "prefilling") {
+          expect(current).toMatchObject({
+            phase: "decoding",
+            t1: 1250,
+            ttft: 250,
+            liveChars: 0,
+            liveEstimate: null,
+          });
+        }
+        if (handler.name === "onReasoningDelta" && phase === "decoding") {
+          expect(current).toMatchObject({ phase: "decoding", liveChars: 8 });
+        }
+        if (handler.name === "onTextStarted" && phase === "prefilling") {
+          expect(current).toMatchObject({
+            phase: "decoding",
+            t1: 1250,
+            ttft: 250,
+            liveChars: 0,
+            liveEstimate: null,
+          });
+        }
+        if (handler.name === "onTextDelta" && phase === "decoding") {
+          expect(current).toMatchObject({ phase: "decoding", liveChars: 9 });
+        }
+        if (handler.name === "onStepEnded" && phase === "decoding") {
+          expect(current).toMatchObject({
+            phase: "done",
+            ttft: 200,
+            prefillTokPerSec: 500,
+            decodeTokPerSec: 12,
+          });
+          expect(result.get("target")?.stepHistory).toHaveLength(1);
+        }
+        if (
+          (handler.name === "onStepFailed" ||
+            handler.name === "onSessionError(scoped)") &&
+          handler.expected[phase] === "error"
+        ) {
+          expect(current).toEqual({ phase: "error", sessionID: "target" });
+        }
+      }
+    );
+  });
+
+  describe("multiple-session isolation matrix", () => {
+    const cases: Array<{
+      name: string;
+      targetPhase: RegisteredPhase;
+      invoke: (collector: SpeedCollector, state: CollectorState) => CollectorState;
+    }> = [
+      {
+        name: "onStepStarted",
+        targetPhase: "done",
+        invoke: (collector, state) =>
+          collector.onStepStarted(state, ev.stepStarted("target", 2000)),
+      },
+      {
+        name: "onReasoningStarted",
+        targetPhase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onReasoningStarted(state, ev.reasoningStarted(1250, "target")),
+      },
+      {
+        name: "onReasoningDelta",
+        targetPhase: "decoding",
+        invoke: (collector, state) =>
+          collector.onReasoningDelta(state, ev.reasoningDelta("abc", "target")),
+      },
+      {
+        name: "onTextStarted",
+        targetPhase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onTextStarted(state, ev.textStarted(1250, "target")),
+      },
+      {
+        name: "onTextDelta",
+        targetPhase: "decoding",
+        invoke: (collector, state) =>
+          collector.onTextDelta(state, ev.textDelta("abc", "target")),
+      },
+      {
+        name: "onStepEnded",
+        targetPhase: "decoding",
+        invoke: (collector, state) =>
+          collector.onStepEnded(state, ev.stepEnded(2200, 10, 0, 100, "target")),
+      },
+      {
+        name: "onStepFailed",
+        targetPhase: "done",
+        invoke: (collector, state) =>
+          collector.onStepFailed(state, ev.stepFailed("target")),
+      },
+      {
+        name: "onIdle",
+        targetPhase: "decoding",
+        invoke: (collector, state) => collector.onIdle(state, "target"),
+      },
+      {
+        name: "onSessionError(scoped)",
+        targetPhase: "done",
+        invoke: (collector, state) => collector.onSessionError(state, "target"),
+      },
+    ];
+
+    it.each(cases)("$name changes no session except its target", ({ targetPhase, invoke }) => {
+      const collector = new SpeedCollector();
+      const state = stateAtPhase(targetPhase);
+      const observer = stateAtPhase("decoding", "observer").get("observer");
+      if (!observer) throw new Error("observer fixture must exist");
+      state.set("observer", observer);
+      const observerBefore = structuredClone(observer);
+
+      const result = invoke(collector, state);
+
+      expect(result.get("observer")).toEqual(observerBefore);
+      expect(result.has("target")).toBe(true);
+      expect(result.size).toBe(2);
+    });
+  });
+
+  it("tick updates every decoding session and preserves non-decoding sessions", () => {
+    const collector = new SpeedCollector();
+    const state = stateAtPhase("decoding", "decode-first");
+    const second = stateAtPhase("decoding", "decode-second").get("decode-second");
+    const prefilling = stateAtPhase("prefilling", "prefilling").get("prefilling");
+    const done = stateAtPhase("done", "done").get("done");
+    const error = stateAtPhase("error", "error").get("error");
+    if (!second || !prefilling || !done || !error) {
+      throw new Error("multi-session fixtures must exist");
+    }
+    if (second.current.phase !== "decoding") {
+      throw new Error("second fixture must be decoding");
+    }
+    second.current = { ...second.current, liveChars: 10 };
+    state.set("decode-second", second);
+    state.set("prefilling", prefilling);
+    state.set("done", done);
+    state.set("error", error);
+    const nonDecodingBefore = stateSnapshot(
+      new Map([
+        ["prefilling", prefilling],
+        ["done", done],
+        ["error", error],
+      ])
+    );
+
+    const ticked = collector.tick(state, 1400);
+
+    expect(ticked.get("decode-first")?.current).toMatchObject({
+      phase: "decoding",
+      liveEstimate: 25,
+    });
+    expect(ticked.get("decode-second")?.current).toMatchObject({
+      phase: "decoding",
+      liveEstimate: 50,
+    });
+    expect(
+      stateSnapshot(
+        new Map(
+          ["prefilling", "done", "error"].map((sessionID) => [
+            sessionID,
+            ticked.get(sessionID)!,
+          ])
+        )
+      )
+    ).toEqual(nonDecodingBefore);
+  });
+
+  it("onIdle selects the requested session even when another session is first", () => {
+    const collector = new SpeedCollector();
+    const other = stateAtPhase("prefilling", "map-first").get("map-first");
+    const target = stateAtPhase("decoding", "target").get("target");
+    if (!other || !target) throw new Error("idle fixtures must exist");
+    other.stepHistory = [
+      {
+        phase: "done",
+        sessionID: "map-first-history",
+        ttft: 1,
+        prefillTokPerSec: 2,
+        decodeTokPerSec: 3,
+      },
+    ];
+    target.stepHistory = [
+      {
+        phase: "done",
+        sessionID: "target-history",
+        ttft: 4,
+        prefillTokPerSec: 5,
+        decodeTokPerSec: 6,
+      },
+    ];
+    const targetHistoryBefore = structuredClone(target.stepHistory);
+    const state: CollectorState = new Map([
+      ["map-first", other],
+      ["target", target],
+    ]);
+
+    const idled = collector.onIdle(state, "target");
+
+    expect(idled.get("target")?.current.phase).toBe("idle");
+    expect(idled.get("target")?.stepHistory).toEqual(targetHistoryBefore);
+    expect(idled.get("map-first")).toEqual(other);
+  });
+
+  it("unscoped session.error changes every in-flight session and no terminal session", () => {
+    const collector = new SpeedCollector();
+    const state: CollectorState = new Map();
+    for (const phase of registeredPhases) {
+      const sessionID = `phase-${phase}`;
+      const metrics = stateAtPhase(phase, sessionID).get(sessionID);
+      if (!metrics) throw new Error(`${phase} fixture must exist`);
+      state.set(sessionID, metrics);
+    }
+    const idleBefore = structuredClone(state.get("phase-idle"));
+    const doneBefore = structuredClone(state.get("phase-done"));
+    const errorBefore = structuredClone(state.get("phase-error"));
+
+    const failed = collector.onSessionError(state);
+
+    expect(failed.get("phase-prefilling")?.current.phase).toBe("error");
+    expect(failed.get("phase-decoding")?.current.phase).toBe("error");
+    expect(failed.get("phase-idle")).toEqual(idleBefore);
+    expect(failed.get("phase-done")).toEqual(doneBefore);
+    expect(failed.get("phase-error")).toEqual(errorBefore);
+  });
+
+  it.each([undefined, null, ""])(
+    "treats %s session.error scope as unscoped",
+    (sessionID) => {
+      const collector = new SpeedCollector();
+      const state = stateAtPhase("prefilling");
+
+      expect(collector.onSessionError(state, sessionID).get("target")?.current).toEqual({
+        phase: "error",
+        sessionID: "target",
+      });
+    }
+  );
+
+  it.each([undefined, null, ""])(
+    "returns the original map for %s unscoped error with no in-flight session",
+    (sessionID) => {
+      const collector = new SpeedCollector();
+      const state = stateAtPhase("done");
+
+      expect(collector.onSessionError(state, sessionID)).toBe(state);
+    }
+  );
+
   it("calculates TTFT from text.started minus step.started", () => {
     const collector = new SpeedCollector();
     let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
@@ -520,6 +940,38 @@ describe("SpeedCollector", () => {
       prefillTokPerSec: null,
     });
   });
+
+  it.each([
+    ["tokens", 0, null],
+    ["output", 2, 500],
+    ["reasoning", 10, 500],
+    ["input", 12, null],
+  ] as const)(
+    "uses safe defaults when runtime step.ended omits %s",
+    (omitted, expectedDecode, expectedPrefill) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+      state = collector.onTextStarted(state, ev.textStarted(1200));
+      const props = structuredClone(ev.stepEnded(2200, 10, 2, 100)) as unknown as
+        Record<string, unknown>;
+      if (omitted === "tokens") {
+        delete props.tokens;
+      } else {
+        delete (props.tokens as Record<string, unknown>)[omitted];
+      }
+
+      state = collector.onStepEnded(
+        state,
+        props as unknown as Parameters<SpeedCollector["onStepEnded"]>[1]
+      );
+
+      expect(state.get("s1")?.current).toMatchObject({
+        phase: "done",
+        decodeTokPerSec: expectedDecode,
+        prefillTokPerSec: expectedPrefill,
+      });
+    }
+  );
 
   it("applies an unscoped session.error only to in-flight sessions", () => {
     const collector = new SpeedCollector();
@@ -648,6 +1100,50 @@ describe("SpeedCollector", () => {
     expect(newMessage.get("s1")?.stepHistory).toHaveLength(0);
   });
 
+  it.each([
+    [
+      "step.failed",
+      (collector: SpeedCollector, state: CollectorState) =>
+        collector.onStepFailed(state, ev.stepFailed("s1")),
+    ],
+    [
+      "session.status idle",
+      (collector: SpeedCollector, state: CollectorState) =>
+        collector.onIdle(state, "s1"),
+    ],
+  ] as const)(
+    "preserves stepHistory across %s and same-message resumption",
+    (_interruption, interrupt) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(
+        new Map(),
+        ev.stepStarted("s1", 1000, "msg1")
+      );
+      state = collector.onTextStarted(state, ev.textStarted(1200));
+      state = collector.onStepEnded(state, ev.stepEnded(2200, 10));
+      expect(state.get("s1")?.stepHistory).toHaveLength(1);
+
+      state = collector.onStepStarted(
+        state,
+        ev.stepStarted("s1", 3000, "msg1")
+      );
+      state = interrupt(collector, state);
+      expect(state.get("s1")?.stepHistory).toHaveLength(1);
+
+      state = collector.onStepStarted(
+        state,
+        ev.stepStarted("s1", 4000, "msg1")
+      );
+      state = collector.onTextStarted(state, ev.textStarted(4200));
+      state = collector.onStepEnded(state, ev.stepEnded(5200, 20));
+
+      expect(state.get("s1")?.stepHistory).toHaveLength(2);
+      expect(
+        state.get("s1")?.stepHistory.map((step) => step.decodeTokPerSec)
+      ).toEqual([10, 20]);
+    }
+  );
+
   it("updates liveEstimate only after more than 0.1 seconds", () => {
     const collector = new SpeedCollector();
     let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
@@ -706,6 +1202,14 @@ describe("SpeedCollector", () => {
     expect(
       zeroCurrent?.phase === "done" && Number.isFinite(zeroCurrent.decodeTokPerSec)
     ).toBe(true);
+
+    let zeroPrefill = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1200));
+    zeroPrefill = collector.onTextStarted(zeroPrefill, ev.textStarted(1200));
+    zeroPrefill = collector.onStepEnded(zeroPrefill, ev.stepEnded(2200, 10));
+    expect(zeroPrefill.get("s1")?.current).toMatchObject({
+      phase: "done",
+      prefillTokPerSec: null,
+    });
 
     let negative = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1200));
     negative = collector.onTextStarted(negative, ev.textStarted(1100));

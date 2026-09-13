@@ -95,6 +95,10 @@ speed-measure-opencode-plugin/
 
 ビルドを採用する理由：モジュール分割でユニットテストが容易、TypeScript 型チェックで API シグネチャの誤りを事前検出、`dist/index.js` を npm package の `main` として公開できる。
 
+> **注記（Issue #3 再実装）**:
+> 初期設計の `jsx: "preserve"` は tsup 8.x の `Options` 型に存在せず（TS2353 エラー）、esbuild のデフォルト挙動により `dist/index.js` に未インポートの `React.createElement` が出力される問題が発生した。また `esbuildOptions` で `preserve` を指定した場合は `.js` に生 JSX が残る一方で `@jsxImportSource` コメントが除去されてしまう。
+> そのため、`esbuildOptions` で `options.jsx = "automatic"` かつ `options.jsxImportSource = "@opentui/solid"` を指定し、`@opentui/solid/jsx-runtime` 経由で JSX をコンパイルする設定を採用した。あわせて `@opentui/solid/jsx-runtime` も `external` に追加している。
+
 ```ts
 // tsup.config.ts
 import { defineConfig } from "tsup";
@@ -102,9 +106,18 @@ export default defineConfig({
   entry: ["src/index.tsx"],
   format: ["esm"],
   // OpenCode ランタイムが注入するので外部化（バンドルしない）
-  external: ["@opentui/solid", "@opentui/solid/store", "solid-js",
-             "@opencode-ai/plugin", "@opencode-ai/sdk"],
-  jsx: "preserve",   // SolidJS JSX の変換を @opentui/solid ランタイムに委ねる
+  external: [
+    "@opentui/solid",
+    "@opentui/solid/store",
+    "@opentui/solid/jsx-runtime",
+    "solid-js",
+    "@opencode-ai/plugin",
+    "@opencode-ai/sdk",
+  ],
+  esbuildOptions(options) {
+    options.jsx = "automatic";
+    options.jsxImportSource = "@opentui/solid";
+  },
   target: "esnext",
   outDir: "dist",
 });

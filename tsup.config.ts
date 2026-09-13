@@ -7,16 +7,19 @@ export default defineConfig({
   external: [
     "@opentui/solid",
     "@opentui/solid/store",
-    "@opentui/solid/jsx-runtime",
     "solid-js",
     "@opencode-ai/plugin",
     "@opencode-ai/sdk",
   ],
   esbuildOptions(options) {
-    options.jsx = "automatic";
-    options.jsxImportSource = "@opentui/solid";
+    // Babel's Solid universal transform runs after bundling. Keeping JSX here
+    // prevents esbuild from eagerly evaluating signal reads in JSX props.
+    options.jsx = "preserve";
+    options.logOverride = {
+      ...options.logOverride,
+      "unsupported-jsx-comment": "silent",
+    };
   },
   target: "esnext",
   outDir: "dist",
 });
-

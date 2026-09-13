@@ -88,12 +88,22 @@ speed-measure-opencode-plugin/
 ├── package.json
 ├── tsconfig.json
 ├── tsup.config.ts
+├── scripts/
+│   └── transform-solid.mjs # バンドル後の Solid universal 変換
 └── vitest.config.ts
 ```
 
-### 2.2 ビルド方針：tsup + `@opentui/solid` 外部化
+### 2.2 ビルド方針：tsup の JSX preserve + Solid universal 事前変換
 
 ビルドを採用する理由：モジュール分割でユニットテストが容易、TypeScript 型チェックで API シグネチャの誤りを事前検出、`dist/index.js` を npm package の `main` として公開できる。
+
+tsup 8.x のトップレベル `jsx: "preserve"` は `Options` 型に存在せず無効である。このため `esbuildOptions` 内で `options.jsx = "preserve"` を指定し、`splitting: false` で `.tsup-out/index.js` へ単一ファイルとしてバンドルする。続けて `babel-preset-solid` を `moduleName: "@opentui/solid"`、`generate: "universal"` で実行し、変換に成功したコードだけを一時ファイルから `dist/index.js` へ rename する。この Babel 設定は `@opentui/solid@0.5.11` の `scripts/solid-transform.js` と同一である。中間出力と公開先を分離するため、Babel が失敗しても生 JSX を含む中間成果物が `dist/index.js` に残らず、直前の正常な配布物を保持できる。
+
+esbuild の automatic JSX 変換は採用しない。automatic では `<text>{value()}</text>` が `jsx("text", { children: value() })` となり、`value()` がランタイムの effect より先に評価されるため、シグナル依存が登録されずライブ表示が更新されない。Solid universal 変換後は、同じ子要素が `_$insert(_el$, value)`、動的 prop が `_$effect(... value() ...)` となり、読み取りがリアクティブスコープ内に保たれる。
+
+OpenCode の実行時変換にも依存しない。`@opentui/solid` の `solid-transform.js` は `/\.[cm]?[jt]sx$/` に一致する `.tsx` / `.jsx` だけへ Solid preset を適用するため、配布物の `.js` は対象外である。案 A（`dist/index.tsx`）と案 B（`src/index.tsx` の直接配布）はこの制約には適合するが、案 C の事前変換が実測で成立し、Issue #3 の `dist/index.js` 要件も維持できるため採用しない。
+
+`tsconfig.json` の `jsx: "preserve"` / `jsxImportSource: "@opentui/solid"` は型検査と tsup の第一段変換に対応し、最終段は上記 Solid universal 変換に統一する。
 
 ```ts
 // tsup.config.ts
@@ -101,12 +111,25 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: ["src/index.tsx"],
   format: ["esm"],
+  splitting: false,
+  clean: true,
   // OpenCode ランタイムが注入するので外部化（バンドルしない）
-  external: ["@opentui/solid", "@opentui/solid/store", "solid-js",
-             "@opencode-ai/plugin", "@opencode-ai/sdk"],
-  jsx: "preserve",   // SolidJS JSX の変換を @opentui/solid ランタイムに委ねる
+  external: [
+    "@opentui/solid",
+    "solid-js",
+    "solid-js/store",
+    "@opencode-ai/plugin",
+    "@opencode-ai/sdk",
+  ],
+  esbuildOptions(options) {
+    options.jsx = "preserve";
+    options.logOverride = {
+      ...options.logOverride,
+      "unsupported-jsx-comment": "silent",
+    };
+  },
   target: "esnext",
-  outDir: "dist",
+  outDir: ".tsup-out",
 });
 ```
 
@@ -119,18 +142,23 @@ export default defineConfig({
   "type": "module",
   "main": "./dist/index.js",
   "exports": { ".": "./dist/index.js" },
+  "files": ["dist"],
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.15.0"
   },
   "devDependencies": {
+    "@babel/core": "^7.28.0",
     "@opencode-ai/plugin": "1.18.30",
-    "@opencode-ai/sdk": "*",
-    "tsup": "^8",
-    "vitest": "^2",
-    "typescript": "^5"
+    "@opencode-ai/sdk": "1.18.30",
+    "@opentui/solid": "^0.5.11",
+    "babel-preset-solid": "^1.9.12",
+    "tsup": "^8.3.6",
+    "vitest": "^2.1.8",
+    "typescript": "^5.7.3"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/transform-solid.mjs",
+    "prepack": "npm run build",
     "test":  "vitest run"
   }
 }
@@ -416,7 +444,7 @@ export default {
 ### 4.3 注意：Solid primitives のインポートパス
 
 - **`solid-js`**: Solid primitives（`createSignal`、`createRoot` 等）の標準ソース。`tsup.config.ts` の `external` リストに含まれており、OpenCode ランタイムが注入する
-- **`@opentui/solid`**: JSX ランタイム・ホスト要素（`<box>`、`<text>` 等）を提供するパッケージ。`/** @jsxImportSource @opentui/solid */` ディレクティブで JSX 変換に使用する。`tui.d.ts` line 5 で `import type { JSX, SolidPlugin } from "@opentui/solid"` が確認されているが、ローカル未インストールのためスロット関数シグネチャや `order` フィールドの型詳細はローカル型から検証不可
+- **`@opentui/solid`**: JSX ランタイム・ホスト要素（`<box>`、`<text>` 等）を提供するパッケージ。型検査とビルド時検証のため devDependency に置き、実行時は OpenCode 側の同パッケージを使うためバンドルから外す。`/** @jsxImportSource @opentui/solid */` は JSX の型付けに使用し、実コードは §2.2 の Solid universal 変換で事前コンパイルする
 
 実装時は jimicze/opencode-plugin-tps の `.tsx` ソースを参照し、`solid-js` と `@opentui/solid` の実際の役割分担を確認すること。
 

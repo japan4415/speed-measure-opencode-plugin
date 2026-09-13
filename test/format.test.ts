@@ -4,6 +4,7 @@ import { formatSpeed, formatTTFT } from "../src/format.js";
 
 describe("formatSpeed", () => {
   it.each([
+    [0, "0 tok/s"],
     [58.3, "58.3 tok/s"],
     [999, "999 tok/s"],
     [1000, "1.0k tok/s"],
@@ -39,6 +40,7 @@ describe("formatSpeed", () => {
 
 describe("formatTTFT", () => {
   it("formats milliseconds as a rounded integer", () => {
+    expect(formatTTFT(0)).toBe("0 ms");
     expect(formatTTFT(340)).toBe("340 ms");
     expect(formatTTFT(340.5)).toBe("341 ms");
   });

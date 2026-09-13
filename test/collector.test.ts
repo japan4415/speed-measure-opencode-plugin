@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Event } from "@opencode-ai/sdk/v2";
 
 import {
@@ -1156,6 +1156,28 @@ describe("SpeedCollector", () => {
     const afterBoundary = collector.tick(state, 1400);
     const current = afterBoundary.get("s1")?.current;
     expect(current?.phase === "decoding" && current.liveEstimate).toBeCloseTo(50);
+  });
+
+  it("uses Date.now for liveEstimate when tick omits now", () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-09-14T00:00:00.000Z");
+      vi.setSystemTime(now);
+
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(
+        new Map(),
+        ev.stepStarted("s1", now - 400)
+      );
+      state = collector.onTextStarted(state, ev.textStarted(now - 200));
+      state = collector.onTextDelta(state, ev.textDelta("1234567890"));
+
+      const ticked = collector.tick(state);
+      const current = ticked.get("s1")?.current;
+      expect(current?.phase === "decoding" && current.liveEstimate).toBeCloseTo(50);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("includes reasoning.delta characters in the live estimate", () => {

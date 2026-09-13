@@ -4,8 +4,6 @@ import { formatSpeed, formatTTFT } from "../src/format.js";
 
 describe("formatSpeed", () => {
   it.each([
-    [0, "0 tok/s"],
-    [-0, "0 tok/s"],
     [58.3, "58.3 tok/s"],
     [999, "999 tok/s"],
     [1000, "1.0k tok/s"],
@@ -16,6 +14,15 @@ describe("formatSpeed", () => {
     [12600, "13k tok/s"],
     [1e9, "1000000k tok/s"],
   ])("formatSpeed(%d) = %s", (value, expected) => {
+    expect(formatSpeed(value)).toBe(expected);
+  });
+
+  it.each([
+    [-Number.MIN_VALUE, "-- tok/s"],
+    [-Number.EPSILON, "-- tok/s"],
+    [-0, "0 tok/s"],
+    [0, "0 tok/s"],
+  ])("honors the zero boundary for speed %s", (value, expected) => {
     expect(formatSpeed(value)).toBe(expected);
   });
 
@@ -54,8 +61,6 @@ describe("formatSpeed", () => {
 
 describe("formatTTFT", () => {
   it.each([
-    [0, "0 ms"],
-    [-0, "0 ms"],
     [340, "340 ms"],
     [340.1, "340 ms"],
     [340.4, "340 ms"],
@@ -63,6 +68,15 @@ describe("formatTTFT", () => {
     [340.6, "341 ms"],
     [1e9, "1000000000 ms"],
   ])("formatTTFT(%s) = %s", (value, expected) => {
+    expect(formatTTFT(value)).toBe(expected);
+  });
+
+  it.each([
+    [-Number.MIN_VALUE, "-- ms"],
+    [-Number.EPSILON, "-- ms"],
+    [-0, "0 ms"],
+    [0, "0 ms"],
+  ])("honors the zero boundary for TTFT %s", (value, expected) => {
     expect(formatTTFT(value)).toBe(expected);
   });
 

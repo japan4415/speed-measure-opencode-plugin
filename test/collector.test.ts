@@ -1387,16 +1387,18 @@ describe("SpeedCollector", () => {
 
   it("updates liveEstimate only after more than 0.1 seconds", () => {
     const collector = new SpeedCollector();
-    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
-    state = collector.onTextStarted(state, ev.textStarted(1200));
+    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", -200));
+    state = collector.onTextStarted(state, ev.textStarted(0));
     state = collector.onTextDelta(state, ev.textDelta("1234567890"));
 
-    const atBoundary = collector.tick(state, 1300);
+    const atBoundary = collector.tick(state, 100);
     expect(atBoundary.get("s1")?.current).toMatchObject({ liveEstimate: null });
 
-    const afterBoundary = collector.tick(state, 1400);
+    const immediatelyAfterBoundary = 100.00000000000001;
+    expect(immediatelyAfterBoundary).toBeGreaterThan(100);
+    const afterBoundary = collector.tick(state, immediatelyAfterBoundary);
     const current = afterBoundary.get("s1")?.current;
-    expect(current?.phase === "decoding" && current.liveEstimate).toBeCloseTo(50);
+    expect(current?.phase === "decoding" && current.liveEstimate).toBeCloseTo(100);
   });
 
   it("uses Date.now for liveEstimate when tick omits now", () => {
@@ -1485,6 +1487,25 @@ describe("SpeedCollector", () => {
       phase: "done",
       prefillTokPerSec: null,
       decodeTokPerSec: 0,
+    });
+  });
+
+  it("calculates decode speed at the smallest positive elapsed time", () => {
+    const collector = new SpeedCollector();
+    const smallestPositiveDecodeTimeSec = Number.MIN_VALUE;
+    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", -1));
+    state = collector.onTextStarted(state, ev.textStarted(0));
+    state = collector.onStepEnded(
+      state,
+      ev.stepEnded(
+        smallestPositiveDecodeTimeSec * 1000,
+        smallestPositiveDecodeTimeSec
+      )
+    );
+
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "done",
+      decodeTokPerSec: 1,
     });
   });
 

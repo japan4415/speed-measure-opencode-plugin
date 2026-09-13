@@ -1,16 +1,18 @@
 [
   {
-    "type": "step.started",
+    "id": "evt-tool-first-step-started",
+    "type": "session.next.step.started",
     "properties": {
       "sessionID": "tool-session",
       "assistantMessageID": "tool-message",
       "timestamp": 2000,
       "agent": "default",
-      "model": { "id": "deepseek-v4.1-flash" }
+      "model": { "id": "deepseek-v4.1-flash", "providerID": "vllm" }
     }
   },
   {
-    "type": "step.ended",
+    "id": "evt-tool-first-step-ended",
+    "type": "session.next.step.ended",
     "properties": {
       "sessionID": "tool-session",
       "assistantMessageID": "tool-message",
@@ -26,17 +28,19 @@
     }
   },
   {
-    "type": "step.started",
+    "id": "evt-tool-second-step-started",
+    "type": "session.next.step.started",
     "properties": {
       "sessionID": "tool-session",
       "assistantMessageID": "tool-message",
       "timestamp": 3000,
       "agent": "default",
-      "model": { "id": "deepseek-v4.1-flash" }
+      "model": { "id": "deepseek-v4.1-flash", "providerID": "vllm" }
     }
   },
   {
-    "type": "text.started",
+    "id": "evt-tool-text-started",
+    "type": "session.next.text.started",
     "properties": {
       "sessionID": "tool-session",
       "assistantMessageID": "tool-message",
@@ -45,7 +49,8 @@
     }
   },
   {
-    "type": "text.delta",
+    "id": "evt-tool-text-delta",
+    "type": "session.next.text.delta",
     "properties": {
       "sessionID": "tool-session",
       "assistantMessageID": "tool-message",
@@ -55,7 +60,8 @@
     }
   },
   {
-    "type": "step.ended",
+    "id": "evt-tool-second-step-ended",
+    "type": "session.next.step.ended",
     "properties": {
       "sessionID": "tool-session",
       "assistantMessageID": "tool-message",

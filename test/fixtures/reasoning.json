@@ -1,16 +1,18 @@
 [
   {
-    "type": "step.started",
+    "id": "evt-reasoning-step-started",
+    "type": "session.next.step.started",
     "properties": {
       "sessionID": "reasoning-session",
       "assistantMessageID": "reasoning-message",
       "timestamp": 1000,
       "agent": "default",
-      "model": { "id": "deepseek-v4.1-flash" }
+      "model": { "id": "deepseek-v4.1-flash", "providerID": "vllm" }
     }
   },
   {
-    "type": "reasoning.started",
+    "id": "evt-reasoning-started",
+    "type": "session.next.reasoning.started",
     "properties": {
       "sessionID": "reasoning-session",
       "assistantMessageID": "reasoning-message",
@@ -19,7 +21,8 @@
     }
   },
   {
-    "type": "reasoning.delta",
+    "id": "evt-reasoning-delta",
+    "type": "session.next.reasoning.delta",
     "properties": {
       "sessionID": "reasoning-session",
       "assistantMessageID": "reasoning-message",
@@ -29,7 +32,8 @@
     }
   },
   {
-    "type": "text.started",
+    "id": "evt-reasoning-text-started",
+    "type": "session.next.text.started",
     "properties": {
       "sessionID": "reasoning-session",
       "assistantMessageID": "reasoning-message",
@@ -38,7 +42,8 @@
     }
   },
   {
-    "type": "text.delta",
+    "id": "evt-reasoning-text-delta",
+    "type": "session.next.text.delta",
     "properties": {
       "sessionID": "reasoning-session",
       "assistantMessageID": "reasoning-message",
@@ -48,7 +53,8 @@
     }
   },
   {
-    "type": "step.ended",
+    "id": "evt-reasoning-step-ended",
+    "type": "session.next.step.ended",
     "properties": {
       "sessionID": "reasoning-session",
       "assistantMessageID": "reasoning-message",

@@ -1,16 +1,18 @@
 [
   {
-    "type": "step.started",
+    "id": "evt-simple-step-started",
+    "type": "session.next.step.started",
     "properties": {
       "sessionID": "simple-session",
       "assistantMessageID": "simple-message",
       "timestamp": 1000,
       "agent": "default",
-      "model": { "id": "deepseek-v4.1-flash" }
+      "model": { "id": "deepseek-v4.1-flash", "providerID": "vllm" }
     }
   },
   {
-    "type": "text.started",
+    "id": "evt-simple-text-started",
+    "type": "session.next.text.started",
     "properties": {
       "sessionID": "simple-session",
       "assistantMessageID": "simple-message",
@@ -19,7 +21,8 @@
     }
   },
   {
-    "type": "text.delta",
+    "id": "evt-simple-text-delta",
+    "type": "session.next.text.delta",
     "properties": {
       "sessionID": "simple-session",
       "assistantMessageID": "simple-message",
@@ -29,7 +32,8 @@
     }
   },
   {
-    "type": "step.ended",
+    "id": "evt-simple-step-ended",
+    "type": "session.next.step.ended",
     "properties": {
       "sessionID": "simple-session",
       "assistantMessageID": "simple-message",

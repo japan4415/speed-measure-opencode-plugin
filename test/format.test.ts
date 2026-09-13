@@ -11,6 +11,7 @@ describe("formatSpeed", () => {
     [9999, "10.0k tok/s"],
     [10000, "10k tok/s"],
     [12345, "12k tok/s"],
+    [12600, "13k tok/s"],
   ])("formatSpeed(%d) = %s", (value, expected) => {
     expect(formatSpeed(value)).toBe(expected);
   });
@@ -19,6 +20,8 @@ describe("formatSpeed", () => {
     [999.94, "999.9 tok/s"],
     [999.95, "1.0k tok/s"],
     [999.99, "1.0k tok/s"],
+    // Regression lock: this result intentionally follows binary floating-point
+    // behavior in Number.prototype.toFixed(1), as documented in DESIGN.md §1.4.
     [9950, "9.9k tok/s"],
     [9999.4, "10.0k tok/s"],
     [9999.5, "10.0k tok/s"],

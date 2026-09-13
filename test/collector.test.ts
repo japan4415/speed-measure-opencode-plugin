@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { Event } from "@opencode-ai/sdk/v2";
 
 import {
   SpeedCollector,
@@ -84,13 +85,134 @@ const ev = {
   }),
 };
 
-type FixtureEvent =
-  | { type: "step.started"; properties: StepStartedProps }
-  | { type: "reasoning.started"; properties: ReasoningStartedProps }
-  | { type: "reasoning.delta"; properties: ReasoningDeltaProps }
-  | { type: "text.started"; properties: TextStartedProps }
-  | { type: "text.delta"; properties: TextDeltaProps }
-  | { type: "step.ended"; properties: StepEndedProps };
+const fixtureEventTypes = [
+  "session.next.step.started",
+  "session.next.reasoning.started",
+  "session.next.reasoning.delta",
+  "session.next.text.started",
+  "session.next.text.delta",
+  "session.next.step.ended",
+] as const;
+
+type FixtureEventType = (typeof fixtureEventTypes)[number];
+type FixtureEvent = Extract<Event, { type: FixtureEventType }>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertString(
+  value: unknown,
+  path: string
+): asserts value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${path} must be a non-empty string`);
+  }
+}
+
+function assertNumber(
+  value: unknown,
+  path: string
+): asserts value is number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${path} must be a finite number`);
+  }
+}
+
+function isFixtureEventType(value: unknown): value is FixtureEventType {
+  return (
+    typeof value === "string" &&
+    fixtureEventTypes.some((type) => type === value)
+  );
+}
+
+function assertFixtureEvent(
+  value: unknown,
+  fixtureName: string,
+  index: number
+): asserts value is FixtureEvent {
+  const eventPath = `${fixtureName}[${index}]`;
+  if (!isRecord(value)) {
+    throw new Error(`${eventPath} must be an object`);
+  }
+
+  assertString(value.id, `${eventPath}.id`);
+  if (!isFixtureEventType(value.type)) {
+    throw new Error(`${eventPath}.type is not a supported SDK event type`);
+  }
+  if (!isRecord(value.properties)) {
+    throw new Error(`${eventPath}.properties must be an object`);
+  }
+
+  const properties = value.properties;
+  assertNumber(properties.timestamp, `${eventPath}.properties.timestamp`);
+  assertString(properties.sessionID, `${eventPath}.properties.sessionID`);
+  assertString(
+    properties.assistantMessageID,
+    `${eventPath}.properties.assistantMessageID`
+  );
+
+  switch (value.type) {
+    case "session.next.step.started":
+      assertString(properties.agent, `${eventPath}.properties.agent`);
+      if (!isRecord(properties.model)) {
+        throw new Error(`${eventPath}.properties.model must be an object`);
+      }
+      assertString(properties.model.id, `${eventPath}.properties.model.id`);
+      assertString(
+        properties.model.providerID,
+        `${eventPath}.properties.model.providerID`
+      );
+      break;
+    case "session.next.step.ended": {
+      assertString(properties.finish, `${eventPath}.properties.finish`);
+      assertNumber(properties.cost, `${eventPath}.properties.cost`);
+      if (!isRecord(properties.tokens)) {
+        throw new Error(`${eventPath}.properties.tokens must be an object`);
+      }
+      const tokens = properties.tokens;
+      assertNumber(tokens.input, `${eventPath}.properties.tokens.input`);
+      assertNumber(tokens.output, `${eventPath}.properties.tokens.output`);
+      assertNumber(tokens.reasoning, `${eventPath}.properties.tokens.reasoning`);
+      if (!isRecord(tokens.cache)) {
+        throw new Error(`${eventPath}.properties.tokens.cache must be an object`);
+      }
+      assertNumber(tokens.cache.read, `${eventPath}.properties.tokens.cache.read`);
+      assertNumber(tokens.cache.write, `${eventPath}.properties.tokens.cache.write`);
+      break;
+    }
+    case "session.next.reasoning.started":
+    case "session.next.reasoning.delta":
+      assertString(
+        properties.reasoningID,
+        `${eventPath}.properties.reasoningID`
+      );
+      if (value.type === "session.next.reasoning.delta") {
+        assertString(properties.delta, `${eventPath}.properties.delta`);
+      }
+      break;
+    case "session.next.text.started":
+    case "session.next.text.delta":
+      assertString(properties.textID, `${eventPath}.properties.textID`);
+      if (value.type === "session.next.text.delta") {
+        assertString(properties.delta, `${eventPath}.properties.delta`);
+      }
+      break;
+  }
+}
+
+function validateFixture(value: unknown, fixtureName: string): FixtureEvent[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${fixtureName} must be an array`);
+  }
+
+  const events: FixtureEvent[] = [];
+  value.forEach((event, index) => {
+    assertFixtureEvent(event, fixtureName, index);
+    events.push(event);
+  });
+  return events;
+}
 
 function replayFixture(events: FixtureEvent[]): CollectorState {
   const collector = new SpeedCollector();
@@ -98,22 +220,22 @@ function replayFixture(events: FixtureEvent[]): CollectorState {
 
   for (const event of events) {
     switch (event.type) {
-      case "step.started":
+      case "session.next.step.started":
         state = collector.onStepStarted(state, event.properties);
         break;
-      case "reasoning.started":
+      case "session.next.reasoning.started":
         state = collector.onReasoningStarted(state, event.properties);
         break;
-      case "reasoning.delta":
+      case "session.next.reasoning.delta":
         state = collector.onReasoningDelta(state, event.properties);
         break;
-      case "text.started":
+      case "session.next.text.started":
         state = collector.onTextStarted(state, event.properties);
         break;
-      case "text.delta":
+      case "session.next.text.delta":
         state = collector.onTextDelta(state, event.properties);
         break;
-      case "step.ended":
+      case "session.next.step.ended":
         state = collector.onStepEnded(state, event.properties);
         break;
     }
@@ -222,7 +344,10 @@ describe("SpeedCollector", () => {
     let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
     state = collector.onStepFailed(state, ev.stepFailed());
 
-    expect(state.get("s1")?.current).toEqual({ phase: "error", sessionID: "s1" });
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "error",
+      sessionID: "s1",
+    });
   });
 
   it("calculates prefill tok/s and returns null when input tokens are zero", () => {
@@ -265,6 +390,35 @@ describe("SpeedCollector", () => {
     expect(state.get("already-error")?.current.phase).toBe("error");
   });
 
+  it("applies a scoped session.error only to the specified session", () => {
+    const collector = new SpeedCollector();
+    let state: CollectorState = new Map();
+    state = collector.onStepStarted(state, ev.stepStarted("target", 1000));
+    state = collector.onStepStarted(state, ev.stepStarted("other", 1000));
+
+    state = collector.onSessionError(state, "target");
+
+    expect(state.get("target")?.current.phase).toBe("error");
+    expect(state.get("other")?.current.phase).toBe("prefilling");
+  });
+
+  it("keeps stepHistory for the same assistant message and resets it for a new one", () => {
+    const collector = new SpeedCollector();
+    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000, "msg1"));
+    state = collector.onTextStarted(state, ev.textStarted(1200));
+    state = collector.onStepEnded(state, ev.stepEnded(2200, 10));
+    expect(state.get("s1")?.stepHistory).toHaveLength(1);
+
+    state = collector.onStepStarted(state, ev.stepStarted("s1", 3000, "msg1"));
+    expect(state.get("s1")?.stepHistory).toHaveLength(1);
+    state = collector.onTextStarted(state, ev.textStarted(3200));
+    state = collector.onStepEnded(state, ev.stepEnded(4200, 10));
+    expect(state.get("s1")?.stepHistory).toHaveLength(2);
+
+    state = collector.onStepStarted(state, ev.stepStarted("s1", 5000, "msg2"));
+    expect(state.get("s1")?.stepHistory).toHaveLength(0);
+  });
+
   it("updates liveEstimate only after more than 0.1 seconds", () => {
     const collector = new SpeedCollector();
     let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
@@ -276,6 +430,18 @@ describe("SpeedCollector", () => {
 
     const afterBoundary = collector.tick(state, 1400);
     const current = afterBoundary.get("s1")?.current;
+    expect(current?.phase === "decoding" && current.liveEstimate).toBeCloseTo(50);
+  });
+
+  it("includes reasoning.delta characters in the live estimate", () => {
+    const collector = new SpeedCollector();
+    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+    state = collector.onReasoningStarted(state, ev.reasoningStarted(1200));
+    state = collector.onReasoningDelta(state, ev.reasoningDelta("1234567890"));
+
+    expect(state.get("s1")?.current).toMatchObject({ liveChars: 10 });
+    const ticked = collector.tick(state, 1400);
+    const current = ticked.get("s1")?.current;
     expect(current?.phase === "decoding" && current.liveEstimate).toBeCloseTo(50);
   });
 
@@ -338,7 +504,7 @@ describe("SpeedCollector", () => {
   });
 
   it("replays the simple-text fixture", () => {
-    const state = replayFixture(simpleTextFixture as FixtureEvent[]);
+    const state = replayFixture(validateFixture(simpleTextFixture, "simple-text.json"));
     expect(state.get("simple-session")?.current).toMatchObject({
       phase: "done",
       ttft: 340,
@@ -349,7 +515,7 @@ describe("SpeedCollector", () => {
   });
 
   it("replays a multi-step tool-call fixture", () => {
-    const state = replayFixture(toolCallFixture as FixtureEvent[]);
+    const state = replayFixture(validateFixture(toolCallFixture, "tool-call.json"));
     expect(state.get("tool-session")?.current).toMatchObject({
       phase: "done",
       ttft: 250,
@@ -360,7 +526,7 @@ describe("SpeedCollector", () => {
   });
 
   it("replays a reasoning-first fixture", () => {
-    const state = replayFixture(reasoningFixture as FixtureEvent[]);
+    const state = replayFixture(validateFixture(reasoningFixture, "reasoning.json"));
     expect(state.get("reasoning-session")?.current).toMatchObject({
       phase: "done",
       ttft: 200,
@@ -368,4 +534,6 @@ describe("SpeedCollector", () => {
       decodeTokPerSec: 50,
     });
   });
+
+  it.todo("tests v1 fallback after Issue #7 implements the plugin entry and 2s timeout");
 });

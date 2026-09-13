@@ -46,6 +46,22 @@ describe("formatSpeed", () => {
   });
 
   it.each([
+    [999.9499999999999, "999.9 tok/s"],
+    [999.95, "1.0k tok/s"],
+    [999.9999999999999, "1.0k tok/s"],
+    [1000, "1.0k tok/s"],
+    [1000.0000000000001, "1.0k tok/s"],
+    [9999.999999999998, "10.0k tok/s"],
+    [10000, "10k tok/s"],
+    [10000.000000000002, "10k tok/s"],
+  ])("locks adjacent floating-point values at a format guard: %s", (
+    value,
+    expected
+  ) => {
+    expect(formatSpeed(value)).toBe(expected);
+  });
+
+  it.each([
     Number.NaN,
     Number.POSITIVE_INFINITY,
     Number.NEGATIVE_INFINITY,

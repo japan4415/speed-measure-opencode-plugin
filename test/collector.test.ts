@@ -472,6 +472,37 @@ function stateAtPhase(
   return new Map([[sessionID, { current, stepHistory: [historyEntry] }]]);
 }
 
+function stateWithTwoHistoryEntries(
+  phase: RegisteredPhase,
+  sessionID = "target"
+): CollectorState {
+  const state = stateAtPhase(phase, sessionID);
+  const metrics = state.get(sessionID);
+  if (!metrics) throw new Error("registered phase fixture must exist");
+
+  const stepHistory: Array<DoneState & { assistantMessageID: string }> = [
+    {
+      phase: "done",
+      sessionID,
+      ttft: 101,
+      prefillTokPerSec: 11,
+      decodeTokPerSec: 21,
+      assistantMessageID: "msg1",
+    },
+    {
+      phase: "done",
+      sessionID,
+      ttft: 202,
+      prefillTokPerSec: 12,
+      decodeTokPerSec: 22,
+      assistantMessageID: "msg1",
+    },
+  ];
+
+  state.set(sessionID, { ...metrics, stepHistory });
+  return state;
+}
+
 function currentPhase(state: CollectorState, sessionID = "target"):
   | RegisteredPhase
   | "unregistered" {
@@ -683,6 +714,108 @@ describe("SpeedCollector", () => {
         expect(stateSnapshot(initial)).toEqual(initialSnapshot);
       }
     );
+  });
+
+  describe("stepHistory preservation across SessionMetrics reconstruction", () => {
+    const cases: Array<{
+      name: string;
+      phase: RegisteredPhase;
+      appendedEntries?: number;
+      invoke: (collector: SpeedCollector, state: CollectorState) => CollectorState;
+    }> = [
+      {
+        name: "onStepStarted (same assistant message)",
+        phase: "idle",
+        invoke: (collector, state) =>
+          collector.onStepStarted(state, ev.stepStarted("target", 2000, "msg1")),
+      },
+      {
+        name: "onReasoningStarted",
+        phase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onReasoningStarted(state, ev.reasoningStarted(1250, "target")),
+      },
+      {
+        name: "onReasoningDelta",
+        phase: "decoding",
+        invoke: (collector, state) =>
+          collector.onReasoningDelta(state, ev.reasoningDelta("abc", "target")),
+      },
+      {
+        name: "onTextStarted",
+        phase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onTextStarted(state, ev.textStarted(1250, "target")),
+      },
+      {
+        name: "onTextDelta",
+        phase: "decoding",
+        invoke: (collector, state) =>
+          collector.onTextDelta(state, ev.textDelta("abcd", "target")),
+      },
+      {
+        name: "onStepEnded (prefilling)",
+        phase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onStepEnded(state, ev.stepEnded(2200, 10, 0, 100, "target")),
+      },
+      {
+        name: "onStepEnded (decoding)",
+        phase: "decoding",
+        appendedEntries: 1,
+        invoke: (collector, state) =>
+          collector.onStepEnded(state, ev.stepEnded(2200, 10, 2, 100, "target")),
+      },
+      {
+        name: "onStepFailed",
+        phase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onStepFailed(state, ev.stepFailed("target")),
+      },
+      {
+        name: "onIdle (prefilling)",
+        phase: "prefilling",
+        invoke: (collector, state) => collector.onIdle(state, "target"),
+      },
+      {
+        name: "onIdle (decoding)",
+        phase: "decoding",
+        invoke: (collector, state) => collector.onIdle(state, "target"),
+      },
+      {
+        name: "onSessionError (scoped)",
+        phase: "prefilling",
+        invoke: (collector, state) => collector.onSessionError(state, "target"),
+      },
+      {
+        name: "onSessionError (unscoped)",
+        phase: "decoding",
+        invoke: (collector, state) => collector.onSessionError(state),
+      },
+      {
+        name: "tick",
+        phase: "decoding",
+        invoke: (collector, state) => collector.tick(state, 1500),
+      },
+    ];
+
+    it.each(cases)("preserves every prior entry through $name", ({
+      phase,
+      appendedEntries = 0,
+      invoke,
+    }) => {
+      const collector = new SpeedCollector();
+      const initial = stateWithTwoHistoryEntries(phase);
+      const historyBefore = structuredClone(
+        initial.get("target")?.stepHistory ?? []
+      );
+
+      const result = invoke(collector, initial);
+      const historyAfter = result.get("target")?.stepHistory;
+
+      expect(historyAfter?.slice(0, historyBefore.length)).toEqual(historyBefore);
+      expect(historyAfter).toHaveLength(historyBefore.length + appendedEntries);
+    });
   });
 
   describe("duplicate event delivery", () => {
@@ -1183,6 +1316,46 @@ describe("SpeedCollector", () => {
   });
 
   it.each([
+    ["ttft just below zero", -Number.MIN_VALUE, 1, null],
+    ["ttft at zero", 0, 1, null],
+    ["smallest positive ttft", Number.MIN_VALUE, 1, Number.POSITIVE_INFINITY],
+    ["positive sub-millisecond ttft", Number.EPSILON, 1, 1000 / Number.EPSILON],
+    ["ordinary positive ttft with one token", 200, 1, 5],
+    ["input just below zero", 1, -Number.MIN_VALUE, null],
+    ["input at zero", 1, 0, null],
+    ["smallest positive input", 1, Number.MIN_VALUE, Number.MIN_VALUE * 1000],
+    ["one input token", 1, 1, 1000],
+  ] as const)(
+    "locks the prefill guard at zero for %s",
+    (_label, ttft, inputTokens, expected) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(
+        new Map(),
+        ev.stepStarted("s1", 0)
+      );
+      state = collector.onTextStarted(state, ev.textStarted(ttft));
+      state = collector.onStepEnded(
+        state,
+        ev.stepEnded(ttft + 1000, 1, 0, inputTokens)
+      );
+
+      const current = state.get("s1")?.current;
+      expect(current?.phase).toBe("done");
+      if (current?.phase !== "done") return;
+      if (expected === null) {
+        expect(current.prefillTokPerSec).toBe(expected);
+      } else {
+        expect(current.prefillTokPerSec).not.toBeNull();
+        if (!Number.isFinite(expected)) {
+          expect(current.prefillTokPerSec).toBe(expected);
+          return;
+        }
+        expect(current.prefillTokPerSec).toBeCloseTo(expected, 12);
+      }
+    }
+  );
+
+  it.each([
     ["tokens", 0, null],
     ["output", 2, 500],
     ["reasoning", 10, 500],
@@ -1508,6 +1681,28 @@ describe("SpeedCollector", () => {
       decodeTokPerSec: 1,
     });
   });
+
+  it.each([
+    ["just below zero", -Number.MIN_VALUE, 0],
+    ["at zero", 0, 0],
+    ["ordinary positive", 1, 2],
+  ] as const)(
+    "locks the decode-time guard %s",
+    (_label, decodeTimeSec, expected) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", -1));
+      state = collector.onTextStarted(state, ev.textStarted(0));
+      state = collector.onStepEnded(
+        state,
+        ev.stepEnded(decodeTimeSec * 1000, 2)
+      );
+
+      expect(state.get("s1")?.current).toMatchObject({
+        phase: "done",
+        decodeTokPerSec: expected,
+      });
+    }
+  );
 
   it("does not mutate the CollectorState passed to state-changing methods", () => {
     const collector = new SpeedCollector();

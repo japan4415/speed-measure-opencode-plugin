@@ -1,3 +1,4 @@
+/// <reference lib="es2015" />
 /**
  * tok/s を人間が読みやすい文字列に変換する純粋関数。
  *
@@ -17,9 +18,13 @@ export function formatSpeed(n: number): string {
   }
 
   if (n < 1000) {
-    // 1000 未満は小数1桁。ただし DESIGN.md §6.2 の 999 -> "999 tok/s" を満たすため、末尾 .0 は除去する
-    const formatted = n.toFixed(1).replace(/\.0$/, "");
-    return `${formatted} tok/s`;
+    // 1000 未満は小数1桁。DESIGN.md §6.2 の 999 -> "999 tok/s" を満たすため末尾 .0 は除去する。
+    // ただし 999.95 等で四捨五入結果が 1000 に達した場合は、"1000 tok/s" と "1.0k tok/s" の
+    // 表示単位の重複・不連続を防ぐため、k 表記（1000 以上 10000 未満）へ繰り上げる。
+    const formatted = n.toFixed(1);
+    if (Number(formatted) < 1000) {
+      return `${formatted.replace(/\.0$/, "")} tok/s`;
+    }
   }
 
   if (n < 10000) {

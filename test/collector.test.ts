@@ -4,6 +4,7 @@ import type { Event } from "@opencode-ai/sdk/v2";
 import {
   SpeedCollector,
   type CollectorState,
+  type DoneState,
   type StepState,
 } from "../src/collector.js";
 import reasoningFixture from "./fixtures/reasoning.json";
@@ -424,6 +425,15 @@ function stateAtPhase(
 ): CollectorState {
   if (phase === "unregistered") return new Map();
 
+  const historyEntry: DoneState & { assistantMessageID: string } = {
+    phase: "done",
+    sessionID,
+    ttft: 111,
+    prefillTokPerSec: 222,
+    decodeTokPerSec: 333,
+    assistantMessageID: "msg1",
+  };
+
   const current: StepState = (() => {
     switch (phase) {
       case "idle":
@@ -459,7 +469,7 @@ function stateAtPhase(
     }
   })();
 
-  return new Map([[sessionID, { current, stepHistory: [] }]]);
+  return new Map([[sessionID, { current, stepHistory: [historyEntry] }]]);
 }
 
 function currentPhase(state: CollectorState, sessionID = "target"):
@@ -471,6 +481,7 @@ function currentPhase(state: CollectorState, sessionID = "target"):
 type HandlerMatrixCase = {
   name: string;
   expected: Record<MatrixPhase, MatrixPhase>;
+  changesFrom: readonly MatrixPhase[];
   invoke: (collector: SpeedCollector, state: CollectorState) => CollectorState;
 };
 
@@ -489,36 +500,42 @@ const handlerPhaseMatrix: HandlerMatrixCase[] = [
     expected: Object.fromEntries(
       matrixPhases.map((phase) => [phase, "prefilling"])
     ) as Record<MatrixPhase, MatrixPhase>,
+    changesFrom: matrixPhases,
     invoke: (collector, state) =>
       collector.onStepStarted(state, ev.stepStarted("target", 2000)),
   },
   {
     name: "onReasoningStarted",
     expected: { ...preserveAll, prefilling: "decoding" },
+    changesFrom: ["prefilling"],
     invoke: (collector, state) =>
       collector.onReasoningStarted(state, ev.reasoningStarted(1250, "target")),
   },
   {
     name: "onReasoningDelta",
     expected: preserveAll,
+    changesFrom: ["decoding"],
     invoke: (collector, state) =>
       collector.onReasoningDelta(state, ev.reasoningDelta("abc", "target")),
   },
   {
     name: "onTextStarted",
     expected: { ...preserveAll, prefilling: "decoding" },
+    changesFrom: ["prefilling"],
     invoke: (collector, state) =>
       collector.onTextStarted(state, ev.textStarted(1250, "target")),
   },
   {
     name: "onTextDelta",
     expected: preserveAll,
+    changesFrom: ["decoding"],
     invoke: (collector, state) =>
       collector.onTextDelta(state, ev.textDelta("abcd", "target")),
   },
   {
     name: "onStepEnded",
     expected: { ...preserveAll, prefilling: "idle", decoding: "done" },
+    changesFrom: ["prefilling", "decoding"],
     invoke: (collector, state) =>
       collector.onStepEnded(state, ev.stepEnded(2200, 10, 2, 100, "target")),
   },
@@ -527,6 +544,7 @@ const handlerPhaseMatrix: HandlerMatrixCase[] = [
     expected: Object.fromEntries(
       matrixPhases.map((phase) => [phase, "error"])
     ) as Record<MatrixPhase, MatrixPhase>,
+    changesFrom: matrixPhases,
     invoke: (collector, state) =>
       collector.onStepFailed(state, ev.stepFailed("target")),
   },
@@ -537,6 +555,7 @@ const handlerPhaseMatrix: HandlerMatrixCase[] = [
       prefilling: "idle",
       decoding: "idle",
     },
+    changesFrom: ["prefilling", "decoding"],
     invoke: (collector, state) => collector.onIdle(state, "target"),
   },
   {
@@ -544,6 +563,7 @@ const handlerPhaseMatrix: HandlerMatrixCase[] = [
     expected: Object.fromEntries(
       matrixPhases.map((phase) => [phase, "error"])
     ) as Record<MatrixPhase, MatrixPhase>,
+    changesFrom: matrixPhases,
     invoke: (collector, state) => collector.onSessionError(state, "target"),
   },
 ];
@@ -552,6 +572,96 @@ const handlerPhaseCases = handlerPhaseMatrix.flatMap((handler) =>
   matrixPhases.map((phase) => ({ handler, phase }))
 );
 
+function expectedMatrixState(
+  handlerName: string,
+  phase: MatrixPhase
+): CollectorState {
+  const initial = stateAtPhase(phase);
+  const stepHistory = initial.get("target")?.stepHistory ?? [];
+  const withCurrent = (current: StepState): CollectorState =>
+    new Map([["target", { current, stepHistory }]]);
+
+  if (handlerName === "onStepStarted") {
+    return withCurrent({
+      phase: "prefilling",
+      sessionID: "target",
+      assistantMessageID: "msg1",
+      t0: 2000,
+    });
+  }
+  if (
+    (handlerName === "onReasoningStarted" || handlerName === "onTextStarted") &&
+    phase === "prefilling"
+  ) {
+    return withCurrent({
+      phase: "decoding",
+      sessionID: "target",
+      assistantMessageID: "msg1",
+      t0: 1000,
+      t1: 1250,
+      ttft: 250,
+      liveChars: 0,
+      liveEstimate: null,
+    });
+  }
+  if (handlerName === "onReasoningDelta" && phase === "decoding") {
+    return withCurrent({
+      phase: "decoding",
+      sessionID: "target",
+      assistantMessageID: "msg1",
+      t0: 1000,
+      t1: 1200,
+      ttft: 200,
+      liveChars: 8,
+      liveEstimate: null,
+    });
+  }
+  if (handlerName === "onTextDelta" && phase === "decoding") {
+    return withCurrent({
+      phase: "decoding",
+      sessionID: "target",
+      assistantMessageID: "msg1",
+      t0: 1000,
+      t1: 1200,
+      ttft: 200,
+      liveChars: 9,
+      liveEstimate: null,
+    });
+  }
+  if (handlerName === "onStepEnded" && phase === "prefilling") {
+    return withCurrent({ phase: "idle" });
+  }
+  if (handlerName === "onStepEnded" && phase === "decoding") {
+    const completed: DoneState & { assistantMessageID: string } = {
+      phase: "done",
+      sessionID: "target",
+      ttft: 200,
+      prefillTokPerSec: 500,
+      decodeTokPerSec: 12,
+      assistantMessageID: "msg1",
+    };
+    return new Map([
+      [
+        "target",
+        { current: completed, stepHistory: [...stepHistory, completed] },
+      ],
+    ]);
+  }
+  if (
+    handlerName === "onStepFailed" ||
+    handlerName === "onSessionError(scoped)"
+  ) {
+    return withCurrent({ phase: "error", sessionID: "target" });
+  }
+  if (
+    handlerName === "onIdle" &&
+    (phase === "prefilling" || phase === "decoding")
+  ) {
+    return withCurrent({ phase: "idle" });
+  }
+  return initial;
+}
+
 describe("SpeedCollector", () => {
   describe("handler × starting phase transition matrix", () => {
     it.each(handlerPhaseCases)(
@@ -559,59 +669,190 @@ describe("SpeedCollector", () => {
       ({ handler, phase }) => {
         const collector = new SpeedCollector();
         const initial = stateAtPhase(phase);
+        const initialSnapshot = stateSnapshot(initial);
         const result = handler.invoke(collector, initial);
 
         expect(currentPhase(result)).toBe(handler.expected[phase]);
 
-        const current = result.get("target")?.current;
-        if (handler.name === "onStepStarted") {
-          expect(current).toMatchObject({
-            phase: "prefilling",
+        if (!handler.changesFrom.includes(phase)) {
+          expect(result).toBe(initial);
+        }
+        expect(stateSnapshot(result)).toEqual(
+          stateSnapshot(expectedMatrixState(handler.name, phase))
+        );
+        expect(stateSnapshot(initial)).toEqual(initialSnapshot);
+      }
+    );
+  });
+
+  describe("duplicate event delivery", () => {
+    const idempotentCases: Array<{
+      name: string;
+      initialPhase: MatrixPhase;
+      invoke: (collector: SpeedCollector, state: CollectorState) => CollectorState;
+    }> = [
+      {
+        name: "step.started",
+        initialPhase: "done",
+        invoke: (collector, state) =>
+          collector.onStepStarted(state, ev.stepStarted("target", 2000)),
+      },
+      {
+        name: "reasoning.started",
+        initialPhase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onReasoningStarted(
+            state,
+            ev.reasoningStarted(1250, "target")
+          ),
+      },
+      {
+        name: "text.started",
+        initialPhase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onTextStarted(state, ev.textStarted(1250, "target")),
+      },
+      {
+        name: "step.ended",
+        initialPhase: "decoding",
+        invoke: (collector, state) =>
+          collector.onStepEnded(
+            state,
+            ev.stepEnded(2200, 10, 2, 100, "target")
+          ),
+      },
+      {
+        name: "step.failed",
+        initialPhase: "prefilling",
+        invoke: (collector, state) =>
+          collector.onStepFailed(state, ev.stepFailed("target")),
+      },
+      {
+        name: "session.status idle",
+        initialPhase: "decoding",
+        invoke: (collector, state) => collector.onIdle(state, "target"),
+      },
+      {
+        name: "session.error",
+        initialPhase: "decoding",
+        invoke: (collector, state) => collector.onSessionError(state, "target"),
+      },
+    ];
+
+    it.each(idempotentCases)(
+      "keeps the complete state stable after duplicate $name",
+      ({ initialPhase, invoke }) => {
+        const collector = new SpeedCollector();
+        const first = invoke(collector, stateAtPhase(initialPhase));
+        const afterFirst = stateSnapshot(first);
+
+        const second = invoke(collector, first);
+
+        expect(stateSnapshot(second)).toEqual(afterFirst);
+      }
+    );
+
+    it.each([
+      [
+        "reasoning.delta",
+        (collector: SpeedCollector, state: CollectorState) =>
+          collector.onReasoningDelta(
+            state,
+            ev.reasoningDelta("abc", "target")
+          ),
+        11,
+      ],
+      [
+        "text.delta",
+        (collector: SpeedCollector, state: CollectorState) =>
+          collector.onTextDelta(state, ev.textDelta("abcd", "target")),
+        13,
+      ],
+    ] as const)(
+      "counts each delivered %s exactly once without resetting measurements",
+      (_name, invoke, expectedLiveChars) => {
+        const collector = new SpeedCollector();
+        const initial = stateAtPhase("decoding");
+        const expectedHistory = initial.get("target")?.stepHistory;
+
+        const first = invoke(collector, initial);
+        const second = invoke(collector, first);
+
+        expect(second.get("target")).toEqual({
+          current: {
+            phase: "decoding",
             sessionID: "target",
             assistantMessageID: "msg1",
-            t0: 2000,
-          });
-        }
-        if (handler.name === "onReasoningStarted" && phase === "prefilling") {
-          expect(current).toMatchObject({
-            phase: "decoding",
-            t1: 1250,
-            ttft: 250,
-            liveChars: 0,
-            liveEstimate: null,
-          });
-        }
-        if (handler.name === "onReasoningDelta" && phase === "decoding") {
-          expect(current).toMatchObject({ phase: "decoding", liveChars: 8 });
-        }
-        if (handler.name === "onTextStarted" && phase === "prefilling") {
-          expect(current).toMatchObject({
-            phase: "decoding",
-            t1: 1250,
-            ttft: 250,
-            liveChars: 0,
-            liveEstimate: null,
-          });
-        }
-        if (handler.name === "onTextDelta" && phase === "decoding") {
-          expect(current).toMatchObject({ phase: "decoding", liveChars: 9 });
-        }
-        if (handler.name === "onStepEnded" && phase === "decoding") {
-          expect(current).toMatchObject({
-            phase: "done",
+            t0: 1000,
+            t1: 1200,
             ttft: 200,
-            prefillTokPerSec: 500,
-            decodeTokPerSec: 12,
-          });
-          expect(result.get("target")?.stepHistory).toHaveLength(1);
-        }
-        if (
-          (handler.name === "onStepFailed" ||
-            handler.name === "onSessionError(scoped)") &&
-          handler.expected[phase] === "error"
-        ) {
-          expect(current).toEqual({ phase: "error", sessionID: "target" });
-        }
+            liveChars: expectedLiveChars,
+            liveEstimate: null,
+          },
+          stepHistory: expectedHistory,
+        });
+      }
+    );
+  });
+
+  describe("delta string input classes", () => {
+    const deltaCases = [
+      ["ordinary text", "abc", 3],
+      ["whitespace only", " \n\t", 3],
+      ["empty", "", 0],
+      ["embedded newline and tab", "a\n\tb", 4],
+      ["multibyte BMP characters", "日本語", 3],
+      ["surrogate-pair emoji", "😀", 2],
+      ["joined emoji sequence", "👨‍👩‍👧‍👦", 11],
+    ] as const;
+    const handlers = [
+      [
+        "reasoning.delta",
+        (collector: SpeedCollector, state: CollectorState, delta: string) =>
+          collector.onReasoningDelta(
+            state,
+            ev.reasoningDelta(delta, "target")
+          ),
+      ],
+      [
+        "text.delta",
+        (collector: SpeedCollector, state: CollectorState, delta: string) =>
+          collector.onTextDelta(state, ev.textDelta(delta, "target")),
+      ],
+    ] as const;
+
+    it.each(
+      handlers.flatMap(([handler, invoke]) =>
+        deltaCases.map(([inputClass, delta, expectedLength]) => ({
+          handler,
+          invoke,
+          inputClass,
+          delta,
+          expectedLength,
+        }))
+      )
+    )(
+      "$handler counts $inputClass by JavaScript UTF-16 length",
+      ({ invoke, delta, expectedLength }) => {
+        const collector = new SpeedCollector();
+        const initial = stateAtPhase("decoding");
+        const expectedHistory = initial.get("target")?.stepHistory;
+
+        const result = invoke(collector, initial, delta);
+
+        expect(result.get("target")).toEqual({
+          current: {
+            phase: "decoding",
+            sessionID: "target",
+            assistantMessageID: "msg1",
+            t0: 1000,
+            t1: 1200,
+            ttft: 200,
+            liveChars: 5 + expectedLength,
+            liveEstimate: null,
+          },
+          stepHistory: expectedHistory,
+        });
       }
     );
   });

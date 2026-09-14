@@ -3409,7 +3409,7 @@ describe("SolidJS reactivity verification (BB1)", () => {
     solidDev: any,
     slotFn: (ctx: any, props: any) => any,
     ctx: any,
-    sessionID: string,
+    sessionID: string | (() => string) | { get session_id(): string },
   ) {
     const root: { type: string; props: Record<string, unknown>; children: any[]; parent: null } = {
       type: "root",
@@ -3420,7 +3420,21 @@ describe("SolidJS reactivity verification (BB1)", () => {
     let disposeRender!: () => void;
     solidDev.createRoot((dispose: any) => {
       disposeRender = dispose;
-      const element = slotFn(ctx, { session_id: sessionID });
+      const props =
+        typeof sessionID === "string"
+          ? {
+              get session_id() {
+                return sessionID;
+              },
+            }
+          : typeof sessionID === "function"
+            ? {
+                get session_id() {
+                  return sessionID();
+                },
+              }
+            : sessionID;
+      const element = slotFn(ctx, props);
       root.children.push(element);
     });
     return { root, dispose: disposeRender };
@@ -3897,6 +3911,363 @@ describe("SolidJS reactivity verification (BB1)", () => {
 
     viewA.dispose();
     viewB.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively updates the same rendered tree when props.session_id changes without re-calling sidebar_content (DD1)", async () => {
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // Seed different metrics for sess-A (ttft 250ms, decode 50 tok/s) and sess-B (ttft 100ms, decode 80 tok/s)
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      textID: "txt-A1",
+      timestamp: 1_250,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 2_250,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      textID: "txt-B1",
+      timestamp: 3_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 4_100,
+      tokens: { input: 100, output: 80, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+
+    // Reactive props with getter delegating to Solid signal (matching OpenTUI splitProps contract)
+    const [currentSessionId, setCurrentSessionId] = solidDev.createSignal("sess-A");
+    const reactiveProps = {
+      get session_id() {
+        return currentSessionId();
+      },
+    };
+
+    let callCount = 0;
+    const trackingSlotFn = (c: any, p: any) => {
+      callCount++;
+      return slotFn(c, p);
+    };
+
+    // Render ONCE inside createRoot
+    const view = renderSlotOnce(solidDev, trackingSlotFn, ctx, reactiveProps);
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    const initialLines = flatten(view.root);
+    expect(initialLines[0]).toBe("Speed");
+    expect(initialLines[1]).toMatch(/^Prefill: 250 ms/);
+    expect(initialLines[2]).toBe("Decode:  50 tok/s");
+
+    // Switch session_id to sess-B on the same rendered tree
+    setCurrentSessionId("sess-B");
+    await Promise.resolve();
+
+    // Verify tree updated to sess-B without re-calling sidebar_content
+    expect(callCount).toBe(1);
+    const switchedLines = flatten(view.root);
+    expect(switchedLines[0]).toBe("Speed");
+    expect(switchedLines[1]).toMatch(/^Prefill: 100 ms/);
+    expect(switchedLines[2]).toBe("Decode:  80 tok/s");
+
+    // Switch back to sess-A
+    setCurrentSessionId("sess-A");
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    const switchedBackLines = flatten(view.root);
+    expect(switchedBackLines[1]).toMatch(/^Prefill: 250 ms/);
+    expect(switchedBackLines[2]).toBe("Decode:  50 tok/s");
+
+    // Switch to an idle/unseeded session
+    setCurrentSessionId("sess-C");
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    expect(flatten(view.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    view.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively updates cache read counts on the same rendered tree when props.session_id changes under showCache: true (DD1)", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/custom" },
+      file: () => ({
+        text: () => Promise.resolve(JSON.stringify({ showCache: true })),
+      }),
+    });
+
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // sess-A: cache read 15
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 2_100,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 15, write: 0 } },
+    });
+
+    // sess-B: cache read 42
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 4_100,
+      tokens: { input: 100, output: 80, reasoning: 0, cache: { read: 42, write: 0 } },
+    });
+
+    const [currentSessionId, setCurrentSessionId] = solidDev.createSignal("sess-A");
+    const reactiveProps = {
+      get session_id() {
+        return currentSessionId();
+      },
+    };
+
+    let callCount = 0;
+    const trackingSlotFn = (c: any, p: any) => {
+      callCount++;
+      return slotFn(c, p);
+    };
+
+    const view = renderSlotOnce(solidDev, trackingSlotFn, ctx, reactiveProps);
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    expect(flatten(view.root)[1]).toContain("│ cache 15");
+    expect(flatten(view.root)[1]).not.toContain("cache 42");
+
+    // Switch to sess-B
+    setCurrentSessionId("sess-B");
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    expect(flatten(view.root)[1]).toContain("│ cache 42");
+    expect(flatten(view.root)[1]).not.toContain("cache 15");
+
+    // Switch back to sess-A
+    setCurrentSessionId("sess-A");
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    expect(flatten(view.root)[1]).toContain("│ cache 15");
+
+    view.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively updates persisted averages on the same rendered tree when props.session_id changes under showAverages: true (DD1)", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/custom" },
+      file: () => ({
+        text: () => Promise.resolve(JSON.stringify({ showAverages: true, showTTFT: true })),
+      }),
+    });
+
+    const kvStore = new Map<string, unknown>();
+    const harness = createApiHarness(true);
+    harness.kvGet.mockImplementation((k: string) => kvStore.get(k));
+    // Do not overwrite pre-existing averages in kvStore so we can verify persisted KV values
+    harness.kvSet.mockImplementation((_k: string, _v: unknown) => {});
+
+    kvStore.set("speed-measure:avg:sess-A:ttft", 200);
+    kvStore.set("speed-measure:avg:sess-A:decode", 30);
+    kvStore.set("speed-measure:avg:sess-A:prefill", 150);
+
+    kvStore.set("speed-measure:avg:sess-B:ttft", 500);
+    kvStore.set("speed-measure:avg:sess-B:decode", 90);
+    kvStore.set("speed-measure:avg:sess-B:prefill", 600);
+
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // Both sessions have completed a step
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_200,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 2_200,
+      tokens: { input: 100, output: 20, reasoning: 0 },
+    });
+
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 4_100,
+      tokens: { input: 100, output: 40, reasoning: 0 },
+    });
+
+    const [currentSessionId, setCurrentSessionId] = solidDev.createSignal("sess-A");
+    const reactiveProps = {
+      get session_id() {
+        return currentSessionId();
+      },
+    };
+
+    let callCount = 0;
+    const trackingSlotFn = (c: any, p: any) => {
+      callCount++;
+      return slotFn(c, p);
+    };
+
+    const view = renderSlotOnce(solidDev, trackingSlotFn, ctx, reactiveProps);
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    const linesA = flatten(view.root);
+    expect(linesA[1]).toContain("(avg 200 ms)");
+    expect(linesA[2]).toBe("Decode:  20 (avg 30) tok/s");
+
+    // Switch to sess-B
+    setCurrentSessionId("sess-B");
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    const linesB = flatten(view.root);
+    expect(linesB[1]).toContain("(avg 500 ms)");
+    expect(linesB[2]).toBe("Decode:  40 (avg 90) tok/s");
+
+    // Switch back to sess-A
+    setCurrentSessionId("sess-A");
+    await Promise.resolve();
+
+    expect(callCount).toBe(1);
+    const linesA2 = flatten(view.root);
+    expect(linesA2[1]).toContain("(avg 200 ms)");
+    expect(linesA2[2]).toBe("Decode:  20 (avg 30) tok/s");
+
+    view.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively switches in-flight phases (prefilling/decoding) on the same rendered tree when props.session_id changes (DD1)", async () => {
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // sess-A: decoding
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_200,
+    });
+
+    // sess-B: prefilling
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 2_000,
+    });
+
+    const [currentSessionId, setCurrentSessionId] = solidDev.createSignal("sess-A");
+    const reactiveProps = {
+      get session_id() {
+        return currentSessionId();
+      },
+    };
+
+    const view = renderSlotOnce(solidDev, slotFn, ctx, reactiveProps);
+    await Promise.resolve();
+
+    const linesA = flatten(view.root);
+    expect(linesA[1]).toMatch(/^Prefill: 200 ms/);
+    expect(linesA[2]).toBe("Decode:  …");
+
+    // Switch to sess-B
+    setCurrentSessionId("sess-B");
+    await Promise.resolve();
+
+    const linesB = flatten(view.root);
+    expect(linesB[1]).toBe("Prefill: …");
+    expect(linesB[2]).toBe("Decode:  --");
+
+    // Switch back to sess-A
+    setCurrentSessionId("sess-A");
+    await Promise.resolve();
+
+    const linesA2 = flatten(view.root);
+    expect(linesA2[1]).toMatch(/^Prefill: 200 ms/);
+    expect(linesA2[2]).toBe("Decode:  …");
+
+    view.dispose();
     await harness.dispose();
   });
 });

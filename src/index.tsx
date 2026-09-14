@@ -37,7 +37,7 @@ function runtimeBun(): BunRuntime | undefined {
   return (globalThis as typeof globalThis & { Bun?: BunRuntime }).Bun;
 }
 
-const CONFIG_PATH = `${runtimeBun()?.env.HOME ?? ""}/.config/opencode/speed-measure.json`;
+export const CONFIG_PATH = `${runtimeBun()?.env.HOME ?? ""}/.config/opencode/speed-measure.json`;
 const KV_PREFIX = "speed-measure:avg:";
 const FALLBACK_DELAY_MS = 2_000;
 

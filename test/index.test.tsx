@@ -18,6 +18,7 @@ vi.mock("solid-js", async (importOriginal) => {
 
 import type { CollectorState } from "../src/collector.js";
 import {
+  CONFIG_PATH,
   DEFAULT_CONFIG,
   type DisplayExtras,
   type SessionAverages,
@@ -210,18 +211,41 @@ function emitCompletedV2(
   });
 }
 
-async function configuredPlugin(config: Record<string, unknown>) {
+async function configuredPlugin(
+  config: Record<string, unknown>,
+  home = "/test-home",
+) {
   vi.resetModules();
-  vi.stubGlobal("Bun", {
-    env: { HOME: "/test-home" },
-    file: vi.fn(() => ({ text: async () => JSON.stringify(config) })),
+  const expectedPath = `${home}/.config/opencode/speed-measure.json`;
+  const fileSpy = vi.fn((path: string) => {
+    if (path === expectedPath) {
+      return { text: async () => JSON.stringify(config) };
+    }
+    return {
+      text: () =>
+        Promise.reject(
+          new Error(`ENOENT: config file not found at expected path: ${path}`),
+        ),
+    };
   });
-  return (await import("../src/index.js")).default;
+  vi.stubGlobal("Bun", {
+    env: { HOME: home },
+    file: fileSpy,
+  });
+  const mod = await import("../src/index.js");
+  expect(mod.default.id).toBe("speed-measure.sidebar");
+  return mod.default;
 }
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe("plugin metadata", () => {
+  it("exports plugin with ID 'speed-measure.sidebar'", () => {
+    expect(plugin.id).toBe("speed-measure.sidebar");
+  });
 });
 
 describe("buildDisplayLines", () => {
@@ -954,25 +978,153 @@ describe("parseConfig", () => {
 });
 
 describe("loadConfig", () => {
-  it("returns default config when file read rejects or throws (file absent, permission error)", async () => {
+  it("loads config by default from ~/.config/opencode/speed-measure.json expanded to os.homedir()", async () => {
+    vi.resetModules();
+    // @ts-expect-error node:os has no types without @types/node
+    const { homedir } = (await import("node:os")) as { homedir: () => string };
+    const homeDir = homedir();
+    const expectedPath = `${homeDir}/.config/opencode/speed-measure.json`;
+    const fileSpy = vi.fn((path: string) => {
+      if (path === expectedPath) {
+        return {
+          text: async () =>
+            JSON.stringify({
+              showTTFT: false,
+              showAverages: true,
+              showCache: true,
+              liveIntervalMs: 250,
+              order: 200,
+            }),
+        };
+      }
+      return {
+        text: () =>
+          Promise.reject(new Error(`ENOENT: unexpected config path ${path}`)),
+      };
+    });
+    vi.stubGlobal("Bun", {
+      env: { HOME: homeDir },
+      file: fileSpy,
+    });
+    const mod = await import("../src/index.js");
+    const config = await mod.loadConfig();
+
+    expect(fileSpy).toHaveBeenCalledOnce();
+    expect(fileSpy).toHaveBeenCalledWith(expectedPath);
+    expect(mod.CONFIG_PATH).toBe(expectedPath);
+    expect(config).toEqual({
+      showTTFT: false,
+      showAverages: true,
+      showCache: true,
+      liveIntervalMs: 250,
+      order: 200,
+    });
+  });
+
+  it("resolves default path using Bun.env.HOME (/Users/discord4415) and verifies file argument", async () => {
+    vi.resetModules();
+    const homeDir = "/Users/discord4415";
+    const expectedPath = "/Users/discord4415/.config/opencode/speed-measure.json";
+    const fileSpy = vi.fn((path: string) => {
+      expect(path).toBe(expectedPath);
+      return {
+        text: async () => JSON.stringify({ showAverages: true }),
+      };
+    });
+    vi.stubGlobal("Bun", {
+      env: { HOME: homeDir },
+      file: fileSpy,
+    });
+    const mod = await import("../src/index.js");
+    const config = await mod.loadConfig();
+
+    expect(fileSpy).toHaveBeenCalledWith(expectedPath);
+    expect(mod.CONFIG_PATH).toBe(expectedPath);
+    expect(config.showAverages).toBe(true);
+  });
+
+  it("does not load config and returns default config when reading from a non-matching path", async () => {
+    vi.resetModules();
+    const homeDir = "/Users/discord4415";
+    const expectedPath = `${homeDir}/.config/opencode/speed-measure.json`;
+    const fileSpy = vi.fn((path: string) => {
+      if (path === expectedPath) {
+        return {
+          text: async () => JSON.stringify({ order: 999 }),
+        };
+      }
+      return {
+        text: () => Promise.reject(new Error(`ENOENT: no such file: ${path}`)),
+      };
+    });
+    vi.stubGlobal("Bun", {
+      env: { HOME: homeDir },
+      file: fileSpy,
+    });
+    const mod = await import("../src/index.js");
+    const config = await mod.loadConfig(
+      `${homeDir}/.config/opencode/speed-measure-typo.json`,
+    );
+    expect(fileSpy).toHaveBeenCalledWith(
+      `${homeDir}/.config/opencode/speed-measure-typo.json`,
+    );
+    expect(config).toEqual(DEFAULT_CONFIG);
+  });
+
+  it("reads from custom path when explicitly passed to loadConfig", async () => {
+    vi.resetModules();
+    const customPath = "/custom/path/custom-config.json";
+    const fileSpy = vi.fn((path: string) => {
+      expect(path).toBe(customPath);
+      return {
+        text: async () => JSON.stringify({ order: 500 }),
+      };
+    });
     vi.stubGlobal("Bun", {
       env: { HOME: "/test-home" },
-      file: vi.fn(() => ({
-        text: vi.fn().mockRejectedValue(new Error("ENOENT: no such file or directory")),
-      })),
+      file: fileSpy,
     });
-    const config = await loadConfig();
+    const mod = await import("../src/index.js");
+    const config = await mod.loadConfig(customPath);
+    expect(fileSpy).toHaveBeenCalledWith(customPath);
+    expect(config.order).toBe(500);
+  });
+
+  it("returns default config when file read rejects or throws (file absent, permission error)", async () => {
+    vi.resetModules();
+    const homeDir = "/test-home";
+    const expectedPath = `${homeDir}/.config/opencode/speed-measure.json`;
+    const fileSpy = vi.fn((path: string) => {
+      expect(path).toBe(expectedPath);
+      return {
+        text: vi.fn().mockRejectedValue(new Error("ENOENT: no such file or directory")),
+      };
+    });
+    vi.stubGlobal("Bun", {
+      env: { HOME: homeDir },
+      file: fileSpy,
+    });
+    const mod = await import("../src/index.js");
+    const config = await mod.loadConfig();
+    expect(fileSpy).toHaveBeenCalledWith(expectedPath);
     expect(config).toEqual(DEFAULT_CONFIG);
   });
 
   it("returns default config when Bun.file synchronously throws", async () => {
-    vi.stubGlobal("Bun", {
-      env: { HOME: "/test-home" },
-      file: vi.fn(() => {
-        throw new Error("EACCES: permission denied");
-      }),
+    vi.resetModules();
+    const homeDir = "/test-home";
+    const expectedPath = `${homeDir}/.config/opencode/speed-measure.json`;
+    const fileSpy = vi.fn((path: string) => {
+      expect(path).toBe(expectedPath);
+      throw new Error("EACCES: permission denied");
     });
-    const config = await loadConfig();
+    vi.stubGlobal("Bun", {
+      env: { HOME: homeDir },
+      file: fileSpy,
+    });
+    const mod = await import("../src/index.js");
+    const config = await mod.loadConfig();
+    expect(fileSpy).toHaveBeenCalledWith(expectedPath);
     expect(config).toEqual(DEFAULT_CONFIG);
   });
 
@@ -1726,14 +1878,22 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
 
   it("initializes with default config without throwing when config file read rejects", async () => {
     vi.useFakeTimers();
+    vi.resetModules();
+    const expectedPath = "/test-home/.config/opencode/speed-measure.json";
+    const fileSpy = vi.fn((path: string) => {
+      expect(path).toBe(expectedPath);
+      return {
+        text: vi.fn().mockRejectedValue(new Error("ENOENT: file not found")),
+      };
+    });
     vi.stubGlobal("Bun", {
       env: { HOME: "/test-home" },
-      file: vi.fn(() => ({
-        text: vi.fn().mockRejectedValue(new Error("ENOENT: file not found")),
-      })),
+      file: fileSpy,
     });
+    const freshPlugin = (await import("../src/index.js")).default;
     const harness = createApiHarness();
-    await expect(plugin.tui(harness.api)).resolves.not.toThrow();
+    await expect(freshPlugin.tui(harness.api)).resolves.not.toThrow();
+    expect(fileSpy).toHaveBeenCalledWith(expectedPath);
 
     expect(harness.registration()?.order).toBe(150);
     expect(sidebarLines(harness.registration(), "sess-A")).toEqual([

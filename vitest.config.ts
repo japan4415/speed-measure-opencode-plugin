@@ -5,6 +5,6 @@ export default defineConfig({
     environment: "node",
     exclude: [...configDefaults.exclude, "**/.workflow-runs/**"],
     globals: true,
-    include: ["test/**/*.test.ts"],
+    include: ["test/**/*.test.{ts,tsx}"],
   },
 });

@@ -64,4 +64,4 @@ npm run build    # tsup + Solid universal 変換で dist/index.js を生成
 
 ## 既知の制限
 
-現在の Prefill 速度計算式は `prefillTokPerSec = tokens.input / (ttft / 1000)` である。vLLM / OpenAI 互換 API では `prompt_tokens` にキャッシュ済みトークンを含む総数が返ることがあり、OpenCode が `tokens.input` にその値をそのまま入れる場合、キャッシュヒット率が高いプロンプトで Prefill 速度が実際より大幅に過大表示される可能性がある（Issue #8 参照、実機検証待ち）。
+プレフィックスキャッシュによる Prefill 速度の過大表示（Issue #19）は対策済みである。`tokens.cache.read` が報告される場合はキャッシュ分を入力トークン数から差し引き、報告されず算出値が 500,000 tok/s を超える場合は異常値として速度を表示せず TTFT のみ表示する。ただし、閾値以下に収まるキャッシュ由来の歪みは検出できず、将来の高速なハードウェアや小さいモデルで正当に 500,000 tok/s を超えた場合も速度が省略される。

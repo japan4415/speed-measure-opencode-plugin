@@ -19,6 +19,9 @@ vi.mock("solid-js", async (importOriginal) => {
 import type { CollectorState } from "../src/collector.js";
 import {
   DEFAULT_CONFIG,
+  type DisplayExtras,
+  type SessionAverages,
+  type SpeedMeasureConfig,
   buildDisplayLines,
   loadConfig,
   parseConfig,
@@ -348,6 +351,575 @@ describe("buildDisplayLines", () => {
       decode: "Decode:  --",
     });
   });
+});
+
+describe("buildDisplayLines - config combinations × state cross-product matrix", () => {
+  type ConfigFlags = Pick<
+    SpeedMeasureConfig,
+    "showTTFT" | "showAverages" | "showCache"
+  >;
+  type ConfigKey = `TTFT:${boolean}_Avg:${boolean}_Cache:${boolean}`;
+
+  const CONFIG_COMBINATIONS: readonly ConfigFlags[] = [
+    { showTTFT: false, showAverages: false, showCache: false },
+    { showTTFT: false, showAverages: false, showCache: true },
+    { showTTFT: false, showAverages: true, showCache: false },
+    { showTTFT: false, showAverages: true, showCache: true },
+    { showTTFT: true, showAverages: false, showCache: false },
+    { showTTFT: true, showAverages: false, showCache: true },
+    { showTTFT: true, showAverages: true, showCache: false },
+    { showTTFT: true, showAverages: true, showCache: true },
+  ] as const;
+
+  const toKey = (cfg: ConfigFlags): ConfigKey =>
+    `TTFT:${cfg.showTTFT}_Avg:${cfg.showAverages}_Cache:${cfg.showCache}`;
+
+  interface MatrixScenario {
+    name: string;
+    sessionID?: string;
+    state: CollectorState;
+    extras?: DisplayExtras;
+    expectedByConfig: Record<ConfigKey, { prefill: string; decode: string }>;
+  }
+
+  const defaultDoneState = {
+    phase: "done" as const,
+    sessionID: "sess-A",
+    ttft: 340,
+    prefillTokPerSec: 2_100,
+    decodeTokPerSec: 58.3,
+  };
+
+  const doneStateNoPrefill = {
+    phase: "done" as const,
+    sessionID: "sess-A",
+    ttft: 340,
+    prefillTokPerSec: null,
+    decodeTokPerSec: 58.3,
+  };
+
+  const sampleAverages: SessionAverages = {
+    ttft: 300,
+    prefillTokPerSec: 2_000,
+    decodeTokPerSec: 50.0,
+  };
+
+  const sampleAveragesNoPrefill: SessionAverages = {
+    ttft: 300,
+    prefillTokPerSec: null,
+    decodeTokPerSec: 50.0,
+  };
+
+  const SCENARIOS: MatrixScenario[] = [
+    {
+      name: "idle phase",
+      state: new Map([
+        ["sess-A", { current: { phase: "idle" }, stepHistory: [] }],
+      ]),
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+      },
+    },
+    {
+      name: "prefilling phase",
+      state: new Map([
+        [
+          "sess-A",
+          {
+            current: {
+              phase: "prefilling",
+              sessionID: "sess-A",
+              assistantMessageID: "msg-1",
+              t0: 1_000,
+            },
+            stepHistory: [],
+          },
+        ],
+      ]),
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: …", decode: "Decode:  --" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: …", decode: "Decode:  --" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: …", decode: "Decode:  --" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: …", decode: "Decode:  --" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: …", decode: "Decode:  --" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: …", decode: "Decode:  --" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: …", decode: "Decode:  --" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: …", decode: "Decode:  --" },
+      },
+    },
+    {
+      name: "decoding phase (with live estimate)",
+      state: new Map([
+        [
+          "sess-A",
+          {
+            current: {
+              phase: "decoding",
+              sessionID: "sess-A",
+              assistantMessageID: "msg-1",
+              t0: 1_000,
+              t1: 1_340,
+              ttft: 340,
+              liveChars: 30,
+              liveEstimate: 45.2,
+            },
+            stepHistory: [],
+          },
+        ],
+      ]),
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
+      },
+    },
+    {
+      name: "decoding phase (without live estimate, null)",
+      state: new Map([
+        [
+          "sess-A",
+          {
+            current: {
+              phase: "decoding",
+              sessionID: "sess-A",
+              assistantMessageID: "msg-1",
+              t0: 1_000,
+              t1: 1_340,
+              ttft: 340,
+              liveChars: 0,
+              liveEstimate: null,
+            },
+            stepHistory: [],
+          },
+        ],
+      ]),
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  …" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  …" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  …" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  …" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  …" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  …" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  …" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  …" },
+      },
+    },
+    {
+      name: "error phase",
+      state: new Map([
+        ["sess-A", { current: { phase: "error", sessionID: "sess-A" }, stepHistory: [] }],
+      ]),
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: error", decode: "Decode:  error" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: error", decode: "Decode:  error" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: error", decode: "Decode:  error" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: error", decode: "Decode:  error" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: error", decode: "Decode:  error" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: error", decode: "Decode:  error" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: error", decode: "Decode:  error" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: error", decode: "Decode:  error" },
+      },
+    },
+    {
+      name: "done (prefill 2.1k, cache 25, explicit averages)",
+      state: new Map([
+        ["sess-A", { current: defaultDoneState, stepHistory: [defaultDoneState] }],
+      ]),
+      extras: { cacheRead: 25, averages: sampleAverages },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: 2.1k tok/s │ cache 25",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: 2.1k (avg 2.0k) tok/s",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: 2.1k (avg 2.0k) tok/s │ cache 25",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s │ cache 25",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 300 ms) │ cache 25",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill 2.1k, cache 0, explicit averages)",
+      state: new Map([
+        ["sess-A", { current: defaultDoneState, stepHistory: [defaultDoneState] }],
+      ]),
+      extras: { cacheRead: 0, averages: sampleAverages },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: 2.1k tok/s │ cache 0",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: 2.1k (avg 2.0k) tok/s",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: 2.1k (avg 2.0k) tok/s │ cache 0",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s │ cache 0",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 300 ms) │ cache 0",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill 2.1k, cache undefined, explicit averages)",
+      state: new Map([
+        ["sess-A", { current: defaultDoneState, stepHistory: [defaultDoneState] }],
+      ]),
+      extras: { averages: sampleAverages },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: 2.1k (avg 2.0k) tok/s",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: 2.1k (avg 2.0k) tok/s",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill null, cache 25, explicit averages)",
+      state: new Map([
+        ["sess-A", { current: doneStateNoPrefill, stepHistory: [doneStateNoPrefill] }],
+      ]),
+      extras: { cacheRead: 25, averages: sampleAveragesNoPrefill },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: -- │ cache 25",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: -- │ cache 25",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms │ cache 25",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 300 ms) │ cache 25",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill null, cache 0, explicit averages)",
+      state: new Map([
+        ["sess-A", { current: doneStateNoPrefill, stepHistory: [doneStateNoPrefill] }],
+      ]),
+      extras: { cacheRead: 0, averages: sampleAveragesNoPrefill },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: -- │ cache 0",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: -- │ cache 0",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms │ cache 0",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 300 ms) │ cache 0",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill null, cache undefined, explicit averages)",
+      state: new Map([
+        ["sess-A", { current: doneStateNoPrefill, stepHistory: [doneStateNoPrefill] }],
+      ]),
+      extras: { averages: sampleAveragesNoPrefill },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: --",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill 2.1k, averages.prefillTokPerSec null, cache undefined)",
+      state: new Map([
+        ["sess-A", { current: defaultDoneState, stepHistory: [defaultDoneState] }],
+      ]),
+      extras: { averages: sampleAveragesNoPrefill },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 300 ms)",
+          decode: "Decode:  58.3 (avg 50) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill 2.1k, cache 25, averages auto-calculated from history)",
+      state: new Map([
+        ["sess-A", { current: defaultDoneState, stepHistory: [defaultDoneState] }],
+      ]),
+      extras: { cacheRead: 25 },
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": {
+          prefill: "Prefill: 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:false_Cache:true": {
+          prefill: "Prefill: 2.1k tok/s │ cache 25",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:false": {
+          prefill: "Prefill: 2.1k (avg 2.1k) tok/s",
+          decode: "Decode:  58.3 (avg 58.3) tok/s",
+        },
+        "TTFT:false_Avg:true_Cache:true": {
+          prefill: "Prefill: 2.1k (avg 2.1k) tok/s │ cache 25",
+          decode: "Decode:  58.3 (avg 58.3) tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:false": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:false_Cache:true": {
+          prefill: "Prefill: 340 ms │ 2.1k tok/s │ cache 25",
+          decode: "Decode:  58.3 tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:false": {
+          prefill: "Prefill: 340 ms (avg 340 ms)",
+          decode: "Decode:  58.3 (avg 58.3) tok/s",
+        },
+        "TTFT:true_Avg:true_Cache:true": {
+          prefill: "Prefill: 340 ms (avg 340 ms) │ cache 25",
+          decode: "Decode:  58.3 (avg 58.3) tok/s",
+        },
+      },
+    },
+    {
+      name: "done (prefill null, cache undefined, no averages)",
+      state: new Map([
+        ["sess-A", { current: doneStateNoPrefill, stepHistory: [] }],
+      ]),
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  58.3 tok/s" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  58.3 tok/s" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  58.3 (avg 58.3) tok/s" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  58.3 (avg 58.3) tok/s" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  58.3 tok/s" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  58.3 tok/s" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: 340 ms (avg 340 ms)", decode: "Decode:  58.3 (avg 58.3) tok/s" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: 340 ms (avg 340 ms)", decode: "Decode:  58.3 (avg 58.3) tok/s" },
+      },
+    },
+    {
+      name: "unknown / absent session metrics",
+      sessionID: "sess-absent",
+      state: new Map(),
+      expectedByConfig: {
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  --" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  --" },
+      },
+    },
+  ];
+
+  const MATRIX_CASES = SCENARIOS.flatMap((scenario) =>
+    CONFIG_COMBINATIONS.map((config) => {
+      const configKey = toKey(config);
+      return {
+        scenarioName: scenario.name,
+        configKey,
+        config,
+        sessionID: scenario.sessionID ?? "sess-A",
+        state: scenario.state,
+        extras: scenario.extras ?? {},
+        expected: scenario.expectedByConfig[configKey],
+      };
+    }),
+  );
+
+  it.each(MATRIX_CASES)(
+    "$scenarioName [$configKey]",
+    ({ config, sessionID, state, extras, expected }) => {
+      const result = buildDisplayLines(
+        state,
+        sessionID,
+        { ...DEFAULT_CONFIG, ...config },
+        extras,
+      );
+      expect(result).toEqual(expected);
+    },
+  );
 });
 
 describe("parseConfig", () => {
@@ -1379,6 +1951,79 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-B:ttft");
     expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-B:decode");
     expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-B:prefill");
+
+    await harness.dispose();
+  });
+
+  it("displays both cache read and averages when showCache and showAverages are simultaneously enabled", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({
+      showCache: true,
+      showAverages: true,
+    });
+    const harness = createApiHarness();
+    await configured.tui(harness.api);
+
+    emitCompletedV2(
+      harness,
+      "sess-A",
+      { input: 100, output: 60, reasoning: 0, cache: { read: 512, write: 0 } },
+    );
+    emitCompletedV2(
+      harness,
+      "sess-B",
+      { input: 100, output: 60, reasoning: 0, cache: { read: 0, write: 0 } },
+    );
+
+    const linesA = sidebarLines(harness.registration(), "sess-A");
+    expect(linesA[1]).toBe("Prefill: 500 ms (avg 500 ms) │ cache 512");
+    expect(linesA[2]).toBe("Decode:  60 (avg 60) tok/s");
+
+    const linesB = sidebarLines(harness.registration(), "sess-B");
+    expect(linesB[1]).toBe("Prefill: 500 ms (avg 500 ms) │ cache 0");
+    expect(linesB[2]).toBe("Decode:  60 (avg 60) tok/s");
+
+    await harness.dispose();
+  });
+
+  it("displays prefill speed with average when showTTFT is false and showAverages is true", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({
+      showTTFT: false,
+      showAverages: true,
+    });
+    const harness = createApiHarness();
+    await configured.tui(harness.api);
+
+    emitCompletedV2(harness, "sess-A");
+
+    const lines = sidebarLines(harness.registration(), "sess-A");
+    expect(lines[1]).toBe("Prefill: 200 (avg 200) tok/s");
+    expect(lines[1]).not.toBe("Prefill: --");
+    expect(lines[2]).toBe("Decode:  60 (avg 60) tok/s");
+
+    await harness.dispose();
+  });
+
+  it("combines prefill speed average and cache display when showTTFT is false, showAverages is true, and showCache is true", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({
+      showTTFT: false,
+      showAverages: true,
+      showCache: true,
+    });
+    const harness = createApiHarness();
+    await configured.tui(harness.api);
+
+    emitCompletedV2(
+      harness,
+      "sess-A",
+      { input: 100, output: 60, reasoning: 0, cache: { read: 256, write: 0 } },
+    );
+
+    const lines = sidebarLines(harness.registration(), "sess-A");
+    expect(lines[1]).toBe("Prefill: 200 (avg 200) tok/s │ cache 256");
+    expect(lines[2]).toBe("Decode:  60 (avg 60) tok/s");
 
     await harness.dispose();
   });

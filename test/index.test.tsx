@@ -16,7 +16,11 @@ vi.mock("solid-js", async (importOriginal) => {
   };
 });
 
-import type { CollectorState } from "../src/collector.js";
+import type {
+  CollectorState,
+  DoneState,
+  SessionMetrics,
+} from "../src/collector.js";
 import {
   CONFIG_PATH,
   DEFAULT_CONFIG,
@@ -24,6 +28,7 @@ import {
   type SessionAverages,
   type SpeedMeasureConfig,
   buildDisplayLines,
+  calculateSessionAverages,
   loadConfig,
   parseConfig,
   scheduleV1Fallback,
@@ -952,11 +957,129 @@ describe("parseConfig", () => {
     expect(parseConfig("{}").order).toBe(150);
   });
 
-  it("uses defaults when JSON parsing fails", () => {
+  it("uses defaults when JSON parsing fails or input is malformed", () => {
     expect(parseConfig("{not valid json")).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig("")).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig("{")).toEqual(DEFAULT_CONFIG);
   });
 
-  it("accepts valid fields and defaults invalid field values", () => {
+  it("falls back to DEFAULT_CONFIG when root value is not a record", () => {
+    expect(parseConfig("null")).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig("[]")).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig("[1, 2, 3]")).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig('"string"')).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig("123")).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig("true")).toEqual(DEFAULT_CONFIG);
+    expect(parseConfig("false")).toEqual(DEFAULT_CONFIG);
+  });
+
+  it("validates showTTFT: accepts boolean, falls back to default (true) for non-boolean types", () => {
+    // Valid booleans
+    expect(parseConfig('{"showTTFT": false}').showTTFT).toBe(false);
+    expect(parseConfig('{"showTTFT": true}').showTTFT).toBe(true);
+
+    // Invalid non-boolean types -> falls back to DEFAULT_CONFIG.showTTFT (true)
+    expect(parseConfig('{"showTTFT": "true"}').showTTFT).toBe(true);
+    expect(parseConfig('{"showTTFT": "false"}').showTTFT).toBe(true);
+    expect(parseConfig('{"showTTFT": 1}').showTTFT).toBe(true);
+    expect(parseConfig('{"showTTFT": 0}').showTTFT).toBe(true);
+    expect(parseConfig('{"showTTFT": null}').showTTFT).toBe(true);
+    expect(parseConfig('{"showTTFT": []}').showTTFT).toBe(true);
+    expect(parseConfig('{"showTTFT": {}}').showTTFT).toBe(true);
+  });
+
+  it("validates showAverages: accepts boolean, falls back to default (false) for non-boolean types", () => {
+    // Valid booleans
+    expect(parseConfig('{"showAverages": true}').showAverages).toBe(true);
+    expect(parseConfig('{"showAverages": false}').showAverages).toBe(false);
+
+    // Invalid non-boolean types -> falls back to DEFAULT_CONFIG.showAverages (false)
+    expect(parseConfig('{"showAverages": "true"}').showAverages).toBe(false);
+    expect(parseConfig('{"showAverages": "false"}').showAverages).toBe(false);
+    expect(parseConfig('{"showAverages": 1}').showAverages).toBe(false);
+    expect(parseConfig('{"showAverages": 0}').showAverages).toBe(false);
+    expect(parseConfig('{"showAverages": null}').showAverages).toBe(false);
+    expect(parseConfig('{"showAverages": []}').showAverages).toBe(false);
+    expect(parseConfig('{"showAverages": {}}').showAverages).toBe(false);
+  });
+
+  it("validates showCache: accepts boolean, falls back to default (false) for non-boolean types", () => {
+    // Valid booleans
+    expect(parseConfig('{"showCache": true}').showCache).toBe(true);
+    expect(parseConfig('{"showCache": false}').showCache).toBe(false);
+
+    // Invalid non-boolean types -> falls back to DEFAULT_CONFIG.showCache (false)
+    expect(parseConfig('{"showCache": "true"}').showCache).toBe(false);
+    expect(parseConfig('{"showCache": "false"}').showCache).toBe(false);
+    expect(parseConfig('{"showCache": 1}').showCache).toBe(false);
+    expect(parseConfig('{"showCache": 0}').showCache).toBe(false);
+    expect(parseConfig('{"showCache": null}').showCache).toBe(false);
+    expect(parseConfig('{"showCache": []}').showCache).toBe(false);
+    expect(parseConfig('{"showCache": {}}').showCache).toBe(false);
+  });
+
+  it("validates liveIntervalMs: accepts finite numbers > 0, falls back to default (150) otherwise", () => {
+    // Valid finite numbers > 0
+    expect(parseConfig('{"liveIntervalMs": 200}').liveIntervalMs).toBe(200);
+    expect(parseConfig('{"liveIntervalMs": 1}').liveIntervalMs).toBe(1);
+    expect(parseConfig('{"liveIntervalMs": 50.5}').liveIntervalMs).toBe(50.5);
+    expect(parseConfig('{"liveIntervalMs": 0.1}').liveIntervalMs).toBe(0.1);
+
+    // Invalid: non-number types -> falls back to 150
+    expect(parseConfig('{"liveIntervalMs": "150"}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": "200"}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": null}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": []}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": {}}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": true}').liveIntervalMs).toBe(150);
+
+    // Invalid: non-positive numbers (<= 0) -> falls back to 150
+    expect(parseConfig('{"liveIntervalMs": 0}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": -1}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": -0.5}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": -100}').liveIntervalMs).toBe(150);
+  });
+
+  it("validates order: accepts finite numbers (including 0, negative, float), falls back to default (150) for non-numbers or non-finite", () => {
+    // Valid finite numbers
+    expect(parseConfig('{"order": 0}').order).toBe(0);
+    expect(parseConfig('{"order": -10}').order).toBe(-10);
+    expect(parseConfig('{"order": -0.5}').order).toBe(-0.5);
+    expect(parseConfig('{"order": 42.5}').order).toBe(42.5);
+    expect(parseConfig('{"order": 200}').order).toBe(200);
+
+    // Invalid non-number types -> falls back to 150
+    expect(parseConfig('{"order": "150"}').order).toBe(150);
+    expect(parseConfig('{"order": "0"}').order).toBe(150);
+    expect(parseConfig('{"order": "-10"}').order).toBe(150);
+    expect(parseConfig('{"order": null}').order).toBe(150);
+    expect(parseConfig('{"order": []}').order).toBe(150);
+    expect(parseConfig('{"order": {}}').order).toBe(150);
+    expect(parseConfig('{"order": true}').order).toBe(150);
+    expect(parseConfig('{"order": false}').order).toBe(150);
+  });
+
+  it("ignores unknown keys and only returns known config properties", () => {
+    const parsed = parseConfig(
+      JSON.stringify({
+        unknownKey: "value",
+        anotherExtra: 12345,
+        showTTFT: false,
+      }),
+    );
+    expect(parsed).toEqual({
+      showTTFT: false,
+      showAverages: false,
+      showCache: false,
+      liveIntervalMs: 150,
+      order: 150,
+    });
+    expect(Object.keys(parsed).sort()).toEqual(
+      ["showTTFT", "showAverages", "showCache", "liveIntervalMs", "order"].sort(),
+    );
+  });
+
+  it("accepts valid fields and defaults invalid field values independently", () => {
     expect(
       parseConfig(
         JSON.stringify({
@@ -973,6 +1096,267 @@ describe("parseConfig", () => {
       showCache: true,
       liveIntervalMs: 150,
       order: 175,
+    });
+
+    expect(
+      parseConfig(
+        JSON.stringify({
+          showTTFT: "invalid",
+          showAverages: "invalid",
+          showCache: "invalid",
+          liveIntervalMs: 250,
+          order: "invalid",
+        }),
+      ),
+    ).toEqual({
+      showTTFT: true,
+      showAverages: false,
+      showCache: false,
+      liveIntervalMs: 250,
+      order: 150,
+    });
+  });
+});
+
+describe("calculateSessionAverages", () => {
+  it("returns undefined when metrics is undefined", () => {
+    expect(calculateSessionAverages(undefined)).toBeUndefined();
+  });
+
+  it("returns undefined when stepHistory is empty and current phase is not done", () => {
+    expect(
+      calculateSessionAverages({
+        stepHistory: [],
+        current: { phase: "idle" },
+      }),
+    ).toBeUndefined();
+
+    expect(
+      calculateSessionAverages({
+        stepHistory: [],
+        current: {
+          phase: "prefilling",
+          sessionID: "sess-A",
+          assistantMessageID: "msg-1",
+          t0: 1000,
+        },
+      }),
+    ).toBeUndefined();
+
+    expect(
+      calculateSessionAverages({
+        stepHistory: [],
+        current: {
+          phase: "decoding",
+          sessionID: "sess-A",
+          assistantMessageID: "msg-1",
+          t0: 1000,
+          t1: 1200,
+          ttft: 200,
+          liveChars: 10,
+          liveEstimate: null,
+        },
+      }),
+    ).toBeUndefined();
+
+    expect(
+      calculateSessionAverages({
+        stepHistory: [],
+        current: { phase: "error", sessionID: "sess-A" },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("falls back to current when stepHistory is empty and current phase is done", () => {
+    const averagesWithPrefill = calculateSessionAverages({
+      stepHistory: [],
+      current: {
+        phase: "done",
+        sessionID: "sess-A",
+        ttft: 250,
+        decodeTokPerSec: 60,
+        prefillTokPerSec: 120,
+      },
+    });
+    expect(averagesWithPrefill).toEqual({
+      ttft: 250,
+      decodeTokPerSec: 60,
+      prefillTokPerSec: 120,
+    });
+
+    const averagesWithoutPrefill = calculateSessionAverages({
+      stepHistory: [],
+      current: {
+        phase: "done",
+        sessionID: "sess-A",
+        ttft: 300,
+        decodeTokPerSec: 40,
+        prefillTokPerSec: null,
+      },
+    });
+    expect(averagesWithoutPrefill).toEqual({
+      ttft: 300,
+      decodeTokPerSec: 40,
+      prefillTokPerSec: null,
+    });
+  });
+
+  it("calculates averages correctly when stepHistory has a single step", () => {
+    const averages = calculateSessionAverages({
+      stepHistory: [
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 180,
+          decodeTokPerSec: 55,
+          prefillTokPerSec: 110,
+        },
+      ],
+      current: { phase: "idle" },
+    });
+    expect(averages).toEqual({
+      ttft: 180,
+      decodeTokPerSec: 55,
+      prefillTokPerSec: 110,
+    });
+  });
+
+  it("calculates averages across multiple steps with all non-null prefill speeds", () => {
+    const averages = calculateSessionAverages({
+      stepHistory: [
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 100,
+          decodeTokPerSec: 40,
+          prefillTokPerSec: 100,
+        },
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 300,
+          decodeTokPerSec: 80,
+          prefillTokPerSec: 200,
+        },
+      ],
+      current: { phase: "idle" },
+    });
+    expect(averages).toEqual({
+      ttft: 200,
+      decodeTokPerSec: 60,
+      prefillTokPerSec: 150,
+    });
+  });
+
+  it("excludes null prefillTokPerSec and does NOT include null as 0 in prefill average", () => {
+    // 3 steps: step 1 = 100, step 2 = null, step 3 = 300
+    // Non-null prefill values: [100, 300] -> mean = 200
+    // If null was treated as 0: [100, 0, 300] -> mean = 133.333...
+    const mixedMetrics: SessionMetrics = {
+      stepHistory: [
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 100,
+          decodeTokPerSec: 50,
+          prefillTokPerSec: 100,
+        },
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 200,
+          decodeTokPerSec: 60,
+          prefillTokPerSec: null,
+        },
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 300,
+          decodeTokPerSec: 70,
+          prefillTokPerSec: 300,
+        },
+      ],
+      current: { phase: "idle" },
+    };
+    const averages = calculateSessionAverages(mixedMetrics);
+    expect(averages).toEqual({
+      ttft: 200,
+      decodeTokPerSec: 60,
+      prefillTokPerSec: 200,
+    });
+
+    // 2 steps: step 1 = null, step 2 = 120
+    // Non-null prefill: [120] -> mean = 120 (NOT (0 + 120) / 2 = 60)
+    const nullFirstMetrics: SessionMetrics = {
+      stepHistory: [
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 150,
+          decodeTokPerSec: 40,
+          prefillTokPerSec: null,
+        },
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 250,
+          decodeTokPerSec: 60,
+          prefillTokPerSec: 120,
+        },
+      ],
+      current: { phase: "idle" },
+    };
+    expect(calculateSessionAverages(nullFirstMetrics)?.prefillTokPerSec).toBe(120);
+
+    // 2 steps: step 1 = 150, step 2 = null
+    // Non-null prefill: [150] -> mean = 150 (NOT (150 + 0) / 2 = 75)
+    const nullSecondMetrics: SessionMetrics = {
+      stepHistory: [
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 150,
+          decodeTokPerSec: 40,
+          prefillTokPerSec: 150,
+        },
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 250,
+          decodeTokPerSec: 60,
+          prefillTokPerSec: null,
+        },
+      ],
+      current: { phase: "idle" },
+    };
+    expect(calculateSessionAverages(nullSecondMetrics)?.prefillTokPerSec).toBe(150);
+  });
+
+  it("returns prefillTokPerSec as null when all steps have null prefillTokPerSec", () => {
+    const allNullMetrics: SessionMetrics = {
+      stepHistory: [
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 120,
+          decodeTokPerSec: 40,
+          prefillTokPerSec: null,
+        },
+        {
+          phase: "done",
+          sessionID: "sess-A",
+          ttft: 180,
+          decodeTokPerSec: 60,
+          prefillTokPerSec: null,
+        },
+      ],
+      current: { phase: "idle" },
+    };
+    const averages = calculateSessionAverages(allNullMetrics);
+    expect(averages).toEqual({
+      ttft: 150,
+      decodeTokPerSec: 50,
+      prefillTokPerSec: null,
     });
   });
 });
@@ -2768,6 +3152,110 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
       "Prefill: --",
       "Decode:  --",
     ]);
+
+    await harness.dispose();
+  });
+
+  it("completes multiple steps in the same session, verifying calculateSessionAverages in the live plugin flow with mixed null prefill and KV persistence", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({
+      showAverages: true,
+      showTTFT: false,
+    });
+    const harness = createApiHarness(true);
+    await configured.tui(harness.api);
+
+    // Step 1: sess-A, msg-multi-1
+    // t0 = 1000, t1 = 1200 (prefillDuration = 200ms, input = 100 -> prefill = 500 tok/s)
+    // t_end = 2200, output = 60, decodeDuration = 1000ms -> decode = 60 tok/s, ttft = 200ms
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 1_200,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 2_200,
+      tokens: { input: 100, output: 60, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+
+    // Step 1 display (showTTFT: false, showAverages: true)
+    // Prefill: current (avg average) tok/s -> "Prefill: 500 (avg 500) tok/s"
+    // Decode: current (avg average) tok/s -> "Decode:  60 (avg 60) tok/s"
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 500 (avg 500) tok/s",
+      "Decode:  60 (avg 60) tok/s",
+    ]);
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:ttft", 200);
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:decode", 60);
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:prefill", 500);
+
+    // Step 2: sess-A, msg-multi-1 (same messageID -> accumulates into stepHistory)
+    // With text.started but tokens.input = 0 -> prefillTokPerSec is null!
+    // t0 = 3000, t1 = 3500 (ttft = 500ms)
+    // t_end = 4500, output = 40, decodeDuration = 1000ms -> decode = 40 tok/s
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 3_500,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 4_500,
+      tokens: { input: 0, output: 40, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+
+    // History has [step1, step2]
+    // ttft avg = (200 + 500) / 2 = 350 ms
+    // decode avg = (60 + 40) / 2 = 50 tok/s
+    // prefill avg = [500] -> 500 tok/s (null is excluded, NOT treated as 0!)
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:ttft", 350);
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:decode", 50);
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:prefill", 500);
+
+    // Step 3: sess-A, msg-multi-1 (same messageID -> 3rd step)
+    // t0 = 5000, t1 = 5400 (ttft = 400ms, input = 100, prefill = 100 / 0.4 = 250 tok/s)
+    // t_end = 6400, output = 80, decodeDuration = 1000ms -> decode = 80 tok/s
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 5_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 5_400,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-multi-1",
+      timestamp: 6_400,
+      tokens: { input: 100, output: 80, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+
+    // History has [step1, step2, step3]
+    // decode avg = (60 + 40 + 80) / 3 = 60 tok/s
+    // prefill avg = (500 + 250) / 2 = 375 tok/s (step2 null excluded! If treated as 0, would be 250)
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 250 (avg 375) tok/s",
+      "Decode:  80 (avg 60) tok/s",
+    ]);
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:decode", 60);
+    expect(harness.api.kv.set).toHaveBeenCalledWith("speed-measure:avg:sess-A:prefill", 375);
 
     await harness.dispose();
   });

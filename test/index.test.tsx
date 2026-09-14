@@ -1047,6 +1047,19 @@ describe("parseConfig", () => {
     expect(parseConfig('{"liveIntervalMs": -1}').liveIntervalMs).toBe(150);
     expect(parseConfig('{"liveIntervalMs": -0.5}').liveIntervalMs).toBe(150);
     expect(parseConfig('{"liveIntervalMs": -100}').liveIntervalMs).toBe(150);
+
+    // Invalid: non-finite numbers (Infinity, -Infinity, NaN) -> falls back to 150
+    expect(parseConfig('{"liveIntervalMs": 1e1000}').liveIntervalMs).toBe(150);
+    expect(parseConfig('{"liveIntervalMs": -1e1000}').liveIntervalMs).toBe(150);
+
+    const jsonParseSpy = vi.spyOn(JSON, "parse");
+    jsonParseSpy.mockReturnValueOnce({ liveIntervalMs: NaN });
+    expect(parseConfig("{}").liveIntervalMs).toBe(150);
+    jsonParseSpy.mockReturnValueOnce({ liveIntervalMs: Infinity });
+    expect(parseConfig("{}").liveIntervalMs).toBe(150);
+    jsonParseSpy.mockReturnValueOnce({ liveIntervalMs: -Infinity });
+    expect(parseConfig("{}").liveIntervalMs).toBe(150);
+    jsonParseSpy.mockRestore();
   });
 
   it("validates order: accepts finite numbers (including 0, negative, float), falls back to default (150) for non-numbers or non-finite", () => {
@@ -1066,6 +1079,19 @@ describe("parseConfig", () => {
     expect(parseConfig('{"order": {}}').order).toBe(150);
     expect(parseConfig('{"order": true}').order).toBe(150);
     expect(parseConfig('{"order": false}').order).toBe(150);
+
+    // Invalid: non-finite numbers (Infinity, -Infinity, NaN) -> falls back to 150
+    expect(parseConfig('{"order": 1e1000}').order).toBe(150);
+    expect(parseConfig('{"order": -1e1000}').order).toBe(150);
+
+    const jsonParseSpy = vi.spyOn(JSON, "parse");
+    jsonParseSpy.mockReturnValueOnce({ order: NaN });
+    expect(parseConfig("{}").order).toBe(150);
+    jsonParseSpy.mockReturnValueOnce({ order: Infinity });
+    expect(parseConfig("{}").order).toBe(150);
+    jsonParseSpy.mockReturnValueOnce({ order: -Infinity });
+    expect(parseConfig("{}").order).toBe(150);
+    jsonParseSpy.mockRestore();
   });
 
   it("ignores unknown keys and only returns known config properties", () => {
@@ -3379,41 +3405,55 @@ describe("SolidJS reactivity verification (BB1)", () => {
     return out;
   }
 
-  it("updates the same rendered tree when signals change without re-calling sidebar_content", async () => {
-    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
-    const harness = createApiHarness();
-    await reactivePlugin.tui(harness.api);
-
+  function renderSlotOnce(
+    solidDev: any,
+    slotFn: (ctx: any, props: any) => any,
+    ctx: any,
+    sessionID: string,
+  ) {
     const root: { type: string; props: Record<string, unknown>; children: any[]; parent: null } = {
       type: "root",
       props: {},
       children: [],
       parent: null,
     };
-    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
-
-    // Render ONCE inside createRoot
     let disposeRender!: () => void;
     solidDev.createRoot((dispose: any) => {
       disposeRender = dispose;
-      const element = harness.registration()!.slots.sidebar_content(ctx, { session_id: "sess-A" });
+      const element = slotFn(ctx, { session_id: sessionID });
       root.children.push(element);
     });
+    return { root, dispose: disposeRender };
+  }
+
+  it("updates the same rendered tree when signals change without re-calling sidebar_content across multiple sessions", async () => {
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // Render ONCE inside createRoot for sess-A and sess-B
+    const viewA = renderSlotOnce(solidDev, slotFn, ctx, "sess-A");
+    const viewB = renderSlotOnce(solidDev, slotFn, ctx, "sess-B");
     await Promise.resolve();
 
     // Initial state (idle)
-    expect(flatten(root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+    expect(flatten(viewA.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
 
-    // Step started -> prefilling
+    // Step started for sess-A -> prefilling
     harness.emit("session.next.step.started", {
       sessionID: "sess-A",
       assistantMessageID: "msg-1",
       timestamp: 1_000,
     });
     await Promise.resolve();
-    expect(flatten(root)).toEqual(["Speed", "Prefill: …", "Decode:  --"]);
+    expect(flatten(viewA.root)).toEqual(["Speed", "Prefill: …", "Decode:  --"]);
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
 
-    // Text started -> decoding
+    // Text started for sess-A -> decoding
     harness.emit("session.next.text.started", {
       sessionID: "sess-A",
       assistantMessageID: "msg-1",
@@ -3421,9 +3461,10 @@ describe("SolidJS reactivity verification (BB1)", () => {
       timestamp: 1_250,
     });
     await Promise.resolve();
-    expect(flatten(root)).toEqual(["Speed", "Prefill: 250 ms", "Decode:  …"]);
+    expect(flatten(viewA.root)).toEqual(["Speed", "Prefill: 250 ms", "Decode:  …"]);
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
 
-    // Step ended -> done
+    // Step ended for sess-A -> done
     harness.emit("session.next.step.ended", {
       sessionID: "sess-A",
       assistantMessageID: "msg-1",
@@ -3431,26 +3472,47 @@ describe("SolidJS reactivity verification (BB1)", () => {
       tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
     });
     await Promise.resolve();
-    const doneText = flatten(root);
-    expect(doneText[0]).toBe("Speed");
-    expect(doneText[1]).toMatch(/^Prefill: 250 ms/);
-    expect(doneText[2]).toBe("Decode:  50 tok/s");
+    const doneTextA = flatten(viewA.root);
+    expect(doneTextA[0]).toBe("Speed");
+    expect(doneTextA[1]).toMatch(/^Prefill: 250 ms/);
+    expect(doneTextA[2]).toBe("Decode:  50 tok/s");
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
 
-    disposeRender();
+    // Now advance sess-B independently
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 4_100,
+      tokens: { input: 100, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    await Promise.resolve();
+    const doneTextB = flatten(viewB.root);
+    expect(doneTextB[1]).toMatch(/^Prefill: 100 ms/);
+    expect(doneTextB[2]).toBe("Decode:  100 tok/s");
+
+    // viewA remains done with 50 tok/s
+    expect(flatten(viewA.root)[2]).toBe("Decode:  50 tok/s");
+
+    viewA.dispose();
+    viewB.dispose();
     await harness.dispose();
   });
 
-  it("reactively updates theme colors on the existing tree without re-calling sidebar_content", async () => {
+  it("reactively updates theme colors on existing trees without re-calling sidebar_content across multiple sessions", async () => {
     const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
     const harness = createApiHarness();
     await reactivePlugin.tui(harness.api);
 
-    const root: { type: string; props: Record<string, unknown>; children: any[]; parent: null } = {
-      type: "root",
-      props: {},
-      children: [],
-      parent: null,
-    };
     const [theme, setTheme] = solidDev.createSignal({ text: "white", textMuted: "gray" });
     const ctx = {
       theme: {
@@ -3459,26 +3521,382 @@ describe("SolidJS reactivity verification (BB1)", () => {
         },
       },
     };
+    const slotFn = harness.registration()!.slots.sidebar_content;
 
-    // Render ONCE inside createRoot
-    let disposeRender!: () => void;
-    solidDev.createRoot((dispose: any) => {
-      disposeRender = dispose;
-      const element = harness.registration()!.slots.sidebar_content(ctx, { session_id: "sess-A" });
-      root.children.push(element);
-    });
+    // Render ONCE inside createRoot for both sess-A and sess-B
+    const viewA = renderSlotOnce(solidDev, slotFn, ctx, "sess-A");
+    const viewB = renderSlotOnce(solidDev, slotFn, ctx, "sess-B");
     await Promise.resolve();
 
-    const box = root.children[0] as any;
-    expect(box.type).toBe("box");
-    expect(box.children.map((c: any) => c.props.fg)).toEqual(["white", "gray", "gray"]);
+    const boxA = viewA.root.children[0] as any;
+    expect(boxA.type).toBe("box");
+    expect(boxA.children.map((c: any) => c.props.fg)).toEqual(["white", "gray", "gray"]);
+
+    const boxB = viewB.root.children[0] as any;
+    expect(boxB.type).toBe("box");
+    expect(boxB.children.map((c: any) => c.props.fg)).toEqual(["white", "gray", "gray"]);
 
     // Update theme reactively
     setTheme({ text: "cyan", textMuted: "darkgray" });
     await Promise.resolve();
-    expect(box.children.map((c: any) => c.props.fg)).toEqual(["cyan", "darkgray", "darkgray"]);
+    expect(boxA.children.map((c: any) => c.props.fg)).toEqual(["cyan", "darkgray", "darkgray"]);
+    expect(boxB.children.map((c: any) => c.props.fg)).toEqual(["cyan", "darkgray", "darkgray"]);
 
-    disposeRender();
+    viewA.dispose();
+    viewB.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively updates cache read counts without re-calling sidebar_content under showCache: true across multiple sessions", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/custom" },
+      file: () => ({
+        text: () => Promise.resolve(JSON.stringify({ showCache: true })),
+      }),
+    });
+
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // Render ONCE for sess-A and sess-B
+    const viewA = renderSlotOnce(solidDev, slotFn, ctx, "sess-A");
+    const viewB = renderSlotOnce(solidDev, slotFn, ctx, "sess-B");
+    await Promise.resolve();
+
+    expect(flatten(viewA.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    // Complete step for sess-A with cache.read = 25
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_200,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 2_200,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 25, write: 0 } },
+    });
+    await Promise.resolve();
+
+    // viewA must reactively show "│ cache 25"
+    expect(flatten(viewA.root)[1]).toMatch(/│ cache 25$/);
+    // viewB remains idle
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    // Complete step for sess-B with cache.read = 42
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 4_100,
+      tokens: { input: 100, output: 60, reasoning: 0, cache: { read: 42, write: 0 } },
+    });
+    await Promise.resolve();
+
+    expect(flatten(viewA.root)[1]).toMatch(/│ cache 25$/);
+    expect(flatten(viewB.root)[1]).toMatch(/│ cache 42$/);
+
+    // Update sess-A again with cache.read = 80
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A2",
+      timestamp: 5_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A2",
+      timestamp: 5_150,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A2",
+      timestamp: 6_150,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 80, write: 0 } },
+    });
+    await Promise.resolve();
+
+    expect(flatten(viewA.root)[1]).toMatch(/│ cache 80$/);
+    expect(flatten(viewB.root)[1]).toMatch(/│ cache 42$/);
+
+    // Step ending with cache omitted under showCache displays cache 0
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A3",
+      timestamp: 7_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A3",
+      timestamp: 7_150,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A3",
+      timestamp: 8_150,
+      tokens: { input: 100, output: 50, reasoning: 0 }, // cache omitted!
+    });
+    await Promise.resolve();
+
+    expect(flatten(viewA.root)[1]).toMatch(/│ cache 0$/);
+
+    viewA.dispose();
+    viewB.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively updates persisted averages without re-calling sidebar_content under showAverages: true across multiple sessions", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/custom" },
+      file: () => ({
+        text: () => Promise.resolve(JSON.stringify({ showAverages: true, showTTFT: true })),
+      }),
+    });
+
+    const kvStore = new Map<string, unknown>();
+    // Pre-populate with stale initial values
+    kvStore.set("speed-measure:avg:sess-A:ttft", 9000);
+    kvStore.set("speed-measure:avg:sess-A:decode", 9000);
+    kvStore.set("speed-measure:avg:sess-B:ttft", 8000);
+    kvStore.set("speed-measure:avg:sess-B:decode", 8000);
+
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    harness.kvGet.mockImplementation((k: string) => kvStore.get(k));
+    harness.kvSet.mockImplementation((k: string, v: unknown) => kvStore.set(k, v));
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // Render ONCE for sess-A and sess-B
+    const viewA = renderSlotOnce(solidDev, slotFn, ctx, "sess-A");
+    const viewB = renderSlotOnce(solidDev, slotFn, ctx, "sess-B");
+    await Promise.resolve();
+
+    // Initial state is idle
+    expect(flatten(viewA.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    // Complete a step for sess-A: ttft = 500ms, decode = 50 tok/s
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_500,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 2_500,
+      tokens: { input: 100, output: 50, reasoning: 0 },
+    });
+    await Promise.resolve();
+
+    // PersistAverages updated kvStore to ttft: 500, decode: 50
+    // viewA must reactively show "avg 500 ms" and "avg 50", NOT the stale 9000
+    const linesA = flatten(viewA.root);
+    expect(linesA[1]).toContain("(avg 500 ms)");
+    expect(linesA[1]).not.toContain("9000");
+    expect(linesA[2]).toBe("Decode:  50 (avg 50) tok/s");
+    expect(linesA[2]).not.toContain("9000");
+
+    // viewB remains idle
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    // Complete a step for sess-B: ttft = 200ms, decode = 80 tok/s
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_200,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 4_200,
+      tokens: { input: 100, output: 80, reasoning: 0 },
+    });
+    await Promise.resolve();
+
+    const linesB = flatten(viewB.root);
+    expect(linesB[1]).toContain("(avg 200 ms)");
+    expect(linesB[1]).not.toContain("8000");
+    expect(linesB[2]).toBe("Decode:  80 (avg 80) tok/s");
+    expect(linesB[2]).not.toContain("8000");
+
+    // Verify viewA is still showing its own average, not affected by sess-B
+    const linesA2 = flatten(viewA.root);
+    expect(linesA2[1]).toContain("(avg 500 ms)");
+    expect(linesA2[2]).toBe("Decode:  50 (avg 50) tok/s");
+
+    viewA.dispose();
+    viewB.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively detects api.kv.ready transitioning from false to true without re-calling sidebar_content", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/custom" },
+      file: () => ({
+        text: () => Promise.resolve(JSON.stringify({ showAverages: true, showTTFT: true })),
+      }),
+    });
+
+    const kvStore = new Map<string, unknown>();
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness(false); // kvReady starts FALSE!
+    harness.kvGet.mockImplementation((k: string) => kvStore.get(k));
+    // Do not overwrite pre-existing averages in kvStore so we can distinguish KV vs memory fallback
+    harness.kvSet.mockImplementation((_k: string, _v: unknown) => {});
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    // Render ONCE while kv.ready is false
+    const viewA = renderSlotOnce(solidDev, slotFn, ctx, "sess-A");
+    const viewB = renderSlotOnce(solidDev, slotFn, ctx, "sess-B");
+    await Promise.resolve();
+
+    // Now kv becomes ready, and KV store has persisted averages: 500 ms / 50 tok/s
+    (harness.api.kv as any).ready = true;
+    kvStore.set("speed-measure:avg:sess-A:ttft", 500);
+    kvStore.set("speed-measure:avg:sess-A:decode", 50);
+    kvStore.set("speed-measure:avg:sess-B:ttft", 300);
+    kvStore.set("speed-measure:avg:sess-B:decode", 80);
+
+    // Complete a step for sess-A with different single-step metrics (ttft: 100ms, decode: 10 tok/s)
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 2_100,
+      tokens: { input: 100, output: 10, reasoning: 0 },
+    });
+    await Promise.resolve();
+
+    // If api.kv.ready was hoisted, it would still see false, returning undefined for persistedAverages,
+    // which falls back to in-memory calculateSessionAverages (showing "avg 100 ms" and "avg 10").
+    // With proper reactivity, it must show KV averages: "avg 500 ms" and "avg 50".
+    const linesA = flatten(viewA.root);
+    expect(linesA[1]).toContain("(avg 500 ms)");
+    expect(linesA[1]).not.toContain("(avg 100 ms)");
+    expect(linesA[2]).toBe("Decode:  10 (avg 50) tok/s");
+
+    // Also verify sess-B with different metrics (ttft: 150ms, decode: 20 tok/s)
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 3_150,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 4_150,
+      tokens: { input: 100, output: 20, reasoning: 0 },
+    });
+    await Promise.resolve();
+
+    const linesB = flatten(viewB.root);
+    expect(linesB[1]).toContain("(avg 300 ms)");
+    expect(linesB[1]).not.toContain("(avg 150 ms)");
+    expect(linesB[2]).toBe("Decode:  20 (avg 80) tok/s");
+
+    viewA.dispose();
+    viewB.dispose();
+    await harness.dispose();
+  });
+
+  it("reactively updates display when showTTFT is false across multiple sessions", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/custom" },
+      file: () => ({
+        text: () => Promise.resolve(JSON.stringify({ showTTFT: false })),
+      }),
+    });
+
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+    const slotFn = harness.registration()!.slots.sidebar_content;
+
+    const viewA = renderSlotOnce(solidDev, slotFn, ctx, "sess-A");
+    const viewB = renderSlotOnce(solidDev, slotFn, ctx, "sess-B");
+    await Promise.resolve();
+
+    expect(flatten(viewA.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    // Complete a step with prefill tok/s
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 1_200,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
+      timestamp: 2_200,
+      tokens: { input: 100, output: 50, reasoning: 0 },
+    });
+    await Promise.resolve();
+
+    const linesA = flatten(viewA.root);
+    // Under showTTFT: false, prefill shows prefillTokPerSec
+    expect(linesA[1]).toMatch(/^Prefill: \d+ tok\/s$/);
+    expect(linesA[2]).toBe("Decode:  50 tok/s");
+    expect(flatten(viewB.root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    viewA.dispose();
+    viewB.dispose();
     await harness.dispose();
   });
 });

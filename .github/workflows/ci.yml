@@ -38,4 +38,31 @@ jobs:
         run: |
           output=$(npm pack --dry-run 2>&1)
           echo "$output"
-          echo "$output" | grep -q 'dist/index\.js' || { echo "Error: dist/index.js is missing from package contents" >&2; exit 1; }
+          echo "$output" | grep -qE '(^|[[:space:]])dist/index\.js$' || { echo "Error: dist/index.js is missing from package contents" >&2; exit 1; }
+
+          package_file=$(npm pack --json --ignore-scripts | node -e '
+            let input = ""
+            process.stdin.on("data", (chunk) => input += chunk)
+            process.stdin.on("end", () => {
+              const result = JSON.parse(input)
+              if (!Array.isArray(result) || result.length !== 1 || !result[0].filename) process.exit(1)
+              process.stdout.write(result[0].filename)
+            })
+          ')
+          trap 'rm -f "$package_file"' EXIT
+          tar -xOf "$package_file" package/package.json > "$RUNNER_TEMP/packed-package.json"
+          node -e '
+            const pkg = require(process.argv[1])
+            if (Object.prototype.hasOwnProperty.call(pkg, "main")) {
+              console.error("Error: packed package.json must not contain main")
+              process.exit(1)
+            }
+            if (pkg.exports && Object.prototype.hasOwnProperty.call(pkg.exports, "./server")) {
+              console.error("Error: packed package.json must not export ./server")
+              process.exit(1)
+            }
+            if (!pkg.exports || !Object.prototype.hasOwnProperty.call(pkg.exports, "./tui")) {
+              console.error("Error: packed package.json must export ./tui")
+              process.exit(1)
+            }
+          ' "$RUNNER_TEMP/packed-package.json"

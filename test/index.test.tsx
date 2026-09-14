@@ -135,46 +135,72 @@ function textContent(value: unknown): string {
   return (value as TestElement).children.map(textContent).join("");
 }
 
-function sidebarLines(
+function sidebarRendered(
   registration: SidebarRegistration | undefined,
   sessionID = "session-1",
-): string[] {
+  theme: { text: string; textMuted: string } = { text: "white", textMuted: "gray" },
+): { tree: TestElement; lines: string[]; children: TestElement[] } {
   expect(registration).toBeDefined();
   stubJsxRuntime();
   const tree = registration!.slots.sidebar_content(
-    { theme: { current: { text: "white", textMuted: "gray" } } },
+    { theme: { current: theme } },
     { session_id: sessionID },
   );
-  return tree.children.map(textContent);
+  expect(tree.type).toBe("box");
+  expect(tree.props.flexDirection).toBe("column");
+  const children = tree.children as TestElement[];
+  expect(children).toHaveLength(3);
+  expect(children[0].type).toBe("text");
+  expect(children[0].props?.fg).toBe(theme.text);
+  expect((children[0].children[0] as TestElement)?.type).toBe("b");
+  expect(children[1].type).toBe("text");
+  expect(children[1].props?.fg).toBe(theme.textMuted);
+  expect(children[2].type).toBe("text");
+  expect(children[2].props?.fg).toBe(theme.textMuted);
+  return {
+    tree,
+    lines: children.map(textContent),
+    children,
+  };
+}
+
+function sidebarLines(
+  registration: SidebarRegistration | undefined,
+  sessionID = "session-1",
+  theme?: { text: string; textMuted: string },
+): string[] {
+  return sidebarRendered(registration, sessionID, theme).lines;
 }
 
 function emitCompletedV2(
   harness: ReturnType<typeof createApiHarness>,
   sessionID = "session-1",
+  tokens = {
+    input: 100,
+    output: 60,
+    reasoning: 0,
+    cache: { read: 25, write: 0 },
+  },
+  timestamps = { t0: 1_000, t1: 1_500, t2: 2_500 },
 ) {
   harness.emit("session.next.step.started", {
     sessionID,
-    assistantMessageID: "message-1",
-    timestamp: 1_000,
+    assistantMessageID: `message-${sessionID}`,
+    timestamp: timestamps.t0,
   });
   harness.emit("session.next.text.started", {
     sessionID,
-    assistantMessageID: "message-1",
-    textID: "text-1",
-    timestamp: 1_500,
+    assistantMessageID: `message-${sessionID}`,
+    textID: `text-${sessionID}`,
+    timestamp: timestamps.t1,
   });
   harness.emit("session.next.step.ended", {
     sessionID,
-    assistantMessageID: "message-1",
-    timestamp: 2_500,
+    assistantMessageID: `message-${sessionID}`,
+    timestamp: timestamps.t2,
     finish: "stop",
     cost: 0,
-    tokens: {
-      input: 100,
-      output: 60,
-      reasoning: 0,
-      cache: { read: 25, write: 0 },
-    },
+    tokens,
   });
 }
 
@@ -468,7 +494,13 @@ describe("plugin.tui", () => {
       "Decode:  …",
     ]);
 
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(250);
+    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+      "Prefill: 340 ms",
+      "Decode:  ~190.5 tok/s",
+    ]);
+
+    vi.advanceTimersByTime(750);
     harness.emit("message.part.updated", {
       part: {
         type: "step-finish",
@@ -518,21 +550,32 @@ describe("plugin.tui", () => {
     emitCompletedV2(harness);
 
     expect(harness.kvSet).not.toHaveBeenCalled();
+    sidebarLines(harness.registration(), "session-1");
+    expect(harness.kvGet).not.toHaveBeenCalled();
     await harness.dispose();
   });
 
-  it("persists averages under speed-measure keys when enabled and ready", async () => {
+  it("persists averages under speed-measure keys when enabled and ready for multiple sessions", async () => {
     vi.useFakeTimers();
     const configured = await configuredPlugin({ showAverages: true });
     const harness = createApiHarness(true);
     await configured.tui(harness.api);
 
-    emitCompletedV2(harness);
+    emitCompletedV2(harness, "session-1");
+    emitCompletedV2(
+      harness,
+      "session-2",
+      { input: 200, output: 80, reasoning: 0, cache: { read: 50, write: 0 } },
+      { t0: 2_000, t1: 2_400, t2: 3_200 },
+    );
 
     expect(harness.kvSet.mock.calls).toEqual([
       ["speed-measure:avg:session-1:ttft", 500],
       ["speed-measure:avg:session-1:decode", 60],
       ["speed-measure:avg:session-1:prefill", 200],
+      ["speed-measure:avg:session-2:ttft", 400],
+      ["speed-measure:avg:session-2:decode", 100],
+      ["speed-measure:avg:session-2:prefill", 500],
     ]);
     await harness.dispose();
   });
@@ -543,7 +586,7 @@ describe("plugin.tui", () => {
     const harness = createApiHarness(false);
     await configured.tui(harness.api);
 
-    emitCompletedV2(harness);
+    emitCompletedV2(harness, "session-1");
 
     expect(harness.kvSet).not.toHaveBeenCalled();
     await harness.dispose();
@@ -990,41 +1033,36 @@ describe("plugin.tui", () => {
     await harness.dispose();
   });
 
-  it("records and displays cache read count on step.ended when showCache is enabled", async () => {
+  it("records and displays cache read count per session when showCache is enabled", async () => {
     vi.useFakeTimers();
     const configured = await configuredPlugin({ showCache: true });
     const harness = createApiHarness();
     await configured.tui(harness.api);
 
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_000,
-    });
-    harness.emit("session.next.text.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_500,
-    });
-    harness.emit("session.next.step.ended", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 2_500,
-      tokens: {
-        input: 100,
-        output: 60,
-        reasoning: 0,
-        cache: { read: 512, write: 0 },
-      },
-    });
+    emitCompletedV2(
+      harness,
+      "session-1",
+      { input: 100, output: 60, reasoning: 0, cache: { read: 512, write: 0 } },
+    );
+    emitCompletedV2(
+      harness,
+      "session-2",
+      { input: 100, output: 60, reasoning: 0, cache: { read: 1024, write: 0 } },
+    );
 
-    const lines = sidebarLines(harness.registration(), "session-1");
-    expect(lines[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 512");
+    const lines1 = sidebarLines(harness.registration(), "session-1");
+    expect(lines1[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 512");
+
+    const lines2 = sidebarLines(harness.registration(), "session-2");
+    expect(lines2[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 1024");
+
+    const lines3 = sidebarLines(harness.registration(), "session-3");
+    expect(lines3[1]).toBe("Prefill: --");
 
     await harness.dispose();
   });
 
-  it("reads and displays persisted averages from api.kv when showAverages is enabled", async () => {
+  it("reads and displays persisted averages from api.kv with strict session isolation", async () => {
     vi.useFakeTimers();
     const configured = await configuredPlugin({ showAverages: true });
     const harness = createApiHarness(true);
@@ -1033,19 +1071,214 @@ describe("plugin.tui", () => {
       if (key === "speed-measure:avg:session-1:ttft") return 250;
       if (key === "speed-measure:avg:session-1:decode") return 75;
       if (key === "speed-measure:avg:session-1:prefill") return 1_500;
+      if (key === "speed-measure:avg:session-2:ttft") return 400;
+      if (key === "speed-measure:avg:session-2:decode") return 120;
+      if (key === "speed-measure:avg:session-2:prefill") return 3_000;
       return undefined;
     });
 
     await configured.tui(harness.api);
 
     emitCompletedV2(harness, "session-1");
+    emitCompletedV2(harness, "session-2");
 
-    const lines = sidebarLines(harness.registration(), "session-1");
-    expect(lines[1]).toContain("(avg 250 ms)");
-    expect(lines[2]).toContain("(avg 75) tok/s");
+    const lines1 = sidebarLines(harness.registration(), "session-1");
+    expect(lines1[1]).toContain("(avg 250 ms)");
+    expect(lines1[2]).toContain("(avg 75) tok/s");
+
+    const lines2 = sidebarLines(harness.registration(), "session-2");
+    expect(lines2[1]).toContain("(avg 400 ms)");
+    expect(lines2[2]).toContain("(avg 120) tok/s");
+
     expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:ttft");
     expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:decode");
     expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:prefill");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-2:ttft");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-2:decode");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-2:prefill");
+
+    await harness.dispose();
+  });
+
+  it("unsubscribes v1 handlers when a v2 step arrives after fallback activation", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    vi.advanceTimersByTime(2_000);
+    expect(harness.handlers.get("message.part.updated")?.size).toBe(1);
+    expect(harness.handlers.get("message.part.delta")?.size).toBe(1);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "message-1",
+      timestamp: 3_000,
+    });
+
+    expect(harness.handlers.get("message.part.updated")?.size).toBe(0);
+    expect(harness.handlers.get("message.part.delta")?.size).toBe(0);
+
+    await harness.dispose();
+  });
+
+  it("ignores non-text deltas in v1 fallback mode without incrementing live chars", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    vi.advanceTimersByTime(2_000);
+
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-start",
+        sessionID: "session-1",
+        messageID: "message-1",
+      },
+    });
+    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+      "Prefill: …",
+      "Decode:  --",
+    ]);
+
+    vi.advanceTimersByTime(200);
+    harness.emit("message.part.delta", {
+      sessionID: "session-1",
+      messageID: "message-1",
+      partID: "thought-1",
+      field: "thought",
+      delta: "internal thinking output that should be ignored",
+    });
+
+    // Should remain in prefilling phase
+    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+      "Prefill: …",
+      "Decode:  --",
+    ]);
+
+    // Advance timer: should still not estimate or transition
+    vi.advanceTimersByTime(300);
+    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+      "Prefill: …",
+      "Decode:  --",
+    ]);
+
+    // Now emit text delta
+    harness.emit("message.part.delta", {
+      sessionID: "session-1",
+      messageID: "message-1",
+      partID: "text-1",
+      field: "text",
+      delta: "forty characters are enough for a sample",
+    });
+
+    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: 500 ms");
+
+    await harness.dispose();
+  });
+
+  it("does not query api.kv for persisted averages when api.kv.ready is false", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({ showAverages: true });
+    const harness = createApiHarness(false);
+    await configured.tui(harness.api);
+
+    emitCompletedV2(harness, "session-1");
+
+    const lines = sidebarLines(harness.registration(), "session-1");
+    expect(harness.kvGet).not.toHaveBeenCalled();
+    expect(lines).toEqual([
+      "Speed",
+      "Prefill: 500 ms (avg 500 ms)",
+      "Decode:  60 (avg 60) tok/s",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("renders header with theme.text and data rows with theme.textMuted", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    const customTheme = {
+      text: "rgba(250, 250, 250, 1)",
+      textMuted: "rgba(100, 100, 100, 1)",
+    };
+    const rendered = sidebarRendered(
+      harness.registration(),
+      "session-1",
+      customTheme,
+    );
+
+    expect(rendered.children[0].props.fg).toBe("rgba(250, 250, 250, 1)");
+    expect(rendered.children[1].props.fg).toBe("rgba(100, 100, 100, 1)");
+    expect(rendered.children[2].props.fg).toBe("rgba(100, 100, 100, 1)");
+
+    await harness.dispose();
+  });
+
+  it("strictly isolates all state, live streaming, and rendering across multiple concurrent sessions", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    // session-1 starts
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_000,
+    });
+    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: --");
+
+    // session-2 starts
+    harness.emit("session.next.step.started", {
+      sessionID: "session-2",
+      assistantMessageID: "msg-2",
+      timestamp: 10_100,
+    });
+    // session-1 starts reasoning
+    harness.emit("session.next.reasoning.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_200,
+    });
+    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: 200 ms");
+    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: …");
+
+    // session-2 starts text directly
+    harness.emit("session.next.text.started", {
+      sessionID: "session-2",
+      assistantMessageID: "msg-2",
+      timestamp: 10_400,
+    });
+    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: 300 ms");
+
+    // session-1 finishes step
+    harness.emit("session.next.step.ended", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 11_000,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: 200 ms │ 500 tok/s");
+    expect(sidebarLines(harness.registration(), "session-1")[2]).toBe("Decode:  62.5 tok/s");
+    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: 300 ms");
+
+    // session-2 fails
+    harness.emit("session.next.step.failed", {
+      sessionID: "session-2",
+      assistantMessageID: "msg-2",
+      error: "session-2 error",
+    });
+    expect(sidebarLines(harness.registration(), "session-2")).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: 200 ms │ 500 tok/s");
 
     await harness.dispose();
   });

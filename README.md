@@ -64,4 +64,14 @@ npm run build    # tsup + Solid universal 変換で dist/index.js を生成
 
 ## 既知の制限
 
-現在の Prefill 速度計算式は `prefillTokPerSec = tokens.input / (ttft / 1000)` である。vLLM / OpenAI 互換 API では `prompt_tokens` にキャッシュ済みトークンを含む総数が返ることがあり、OpenCode が `tokens.input` にその値をそのまま入れる場合、キャッシュヒット率が高いプロンプトで Prefill 速度が実際より大幅に過大表示される可能性がある（Issue #8 参照、実機検証待ち）。
+OpenCode 1.18.30 の `tokens.input` は、既にキャッシュ読み出し分を除いた入力トークン数である。Anthropic / OpenAI / Google / Bedrock のように `cached_tokens` を報告するプロバイダでは、この値から Prefill 速度を正しく算出できる。
+
+一方、`cached_tokens` を報告しないプロバイダでは、`tokens.input` が全プロンプトトークンになることがある。実測したローカル vLLM では次の結果となり、キャッシュによって TTFT だけが短縮されたため Prefill 速度が膨張した。
+
+| ケース | TTFT | `prompt_tokens` | 見かけ Prefill | cold 比 |
+|---|---:|---:|---:|---:|
+| 完全 cold | 12,384 ms | 4,217 | 341 tok/s | 基準 |
+| 完全 warm | 460 ms | 4,217 | 9,170 tok/s | 27倍 |
+| 部分ヒット | 2,460 ms | 4,215 | 1,713 tok/s | 5倍 |
+
+500,000 tok/s を超える算出値を表示しない閾値は、極端な異常値を抑えるだけの緩和策である。上記の 5〜27倍の膨張はいずれも閾値を下回って素通りするため、`cached_tokens` を報告しないプロバイダでキャッシュが効いている間、Prefill 速度は参考値であり TTFT のみが信頼できる。また、将来の高速なハードウェアや小さいモデルで正当に閾値を超えた場合も速度が省略される。

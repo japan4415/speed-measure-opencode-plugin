@@ -40,8 +40,8 @@ OpenCode は bare `latest` を自動再取得しないため、プラグイン�
 導入時に選んだ scope に対応するコマンドを実行してください。
 
 ```bash
-opencode plugin speed-measure-opencode-plugin@<version> -g --force  # グローバル設定を更新
-opencode plugin speed-measure-opencode-plugin@<version> --force     # プロジェクト設定を更新
+opencode plugin speed-measure-opencode-plugin@0.1.0 -g --force  # グローバル設定を更新
+opencode plugin speed-measure-opencode-plugin@0.1.0 --force     # プロジェクト設定を更新
 ```
 
 ### 代替（ソースから）

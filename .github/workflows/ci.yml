@@ -36,10 +36,12 @@ jobs:
 
       - name: Verify package contents
         run: |
+          # prepack 経路自体を検証するため、直前の build 後も意図的に scripts を有効にして dry-run する。
           output=$(npm pack --dry-run 2>&1)
           echo "$output"
           echo "$output" | grep -qE '(^|[[:space:]])dist/index\.js$' || { echo "Error: dist/index.js is missing from package contents" >&2; exit 1; }
 
+          # npm 10.x の配列形式を前提とする。npm 12 以降のオブジェクト形式へ更新時はパーサの変更が必要。
           package_file=$(npm pack --json --ignore-scripts | node -e '
             let input = ""
             process.stdin.on("data", (chunk) => input += chunk)

@@ -25,7 +25,30 @@ Decode:  58.3 tok/s
 
 ## インストール
 
+### 推奨（npm 経由）
+
 ```bash
+opencode plugin speed-measure-opencode-plugin -g      # グローバル設定に追加
+opencode plugin speed-measure-opencode-plugin         # プロジェクト単位で追加
+```
+
+- `-g` は設定の書き込み先（グローバル `~/.config/opencode` か プロジェクト `.opencode` か）を変えるものであり、パッケージのインストール先（OpenCode 管理キャッシュ）は変わりません。
+
+#### 更新手順
+
+OpenCode は bare `latest` を自動再取得しないため、プラグインの更新はバージョンを明示して `--force` で上書きします。
+
+```bash
+opencode plugin speed-measure-opencode-plugin@<version> -g --force
+```
+
+### 代替（ソースから）
+
+開発者向けの手順です。
+
+```bash
+git clone https://github.com/japan4415/speed-measure-opencode-plugin.git
+cd speed-measure-opencode-plugin
 npm install
 npm run build
 ```

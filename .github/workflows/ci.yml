@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  check:
+    name: Build, Test & Pack Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Verify package contents
+        run: |
+          # prepack 経路自体を検証するため、直前の build 後も意図的に scripts を有効にして dry-run する。
+          output=$(npm pack --dry-run 2>&1)
+          echo "$output"
+          echo "$output" | grep -qE '(^|[[:space:]])dist/index\.js$' || { echo "Error: dist/index.js is missing from package contents" >&2; exit 1; }
+
+          # npm 10.x の配列形式を前提とする。npm 12 以降のオブジェクト形式へ更新時はパーサの変更が必要。
+          package_file=$(npm pack --json --ignore-scripts | node -e '
+            let input = ""
+            process.stdin.on("data", (chunk) => input += chunk)
+            process.stdin.on("end", () => {
+              const result = JSON.parse(input)
+              if (!Array.isArray(result) || result.length !== 1 || !result[0].filename) process.exit(1)
+              process.stdout.write(result[0].filename)
+            })
+          ')
+          trap 'rm -f "$package_file"' EXIT
+          tar -xOf "$package_file" package/package.json > "$RUNNER_TEMP/packed-package.json"
+          node -e '
+            const pkg = require(process.argv[1])
+            if (Object.prototype.hasOwnProperty.call(pkg, "main")) {
+              console.error("Error: packed package.json must not contain main")
+              process.exit(1)
+            }
+            if (pkg.exports && Object.prototype.hasOwnProperty.call(pkg.exports, "./server")) {
+              console.error("Error: packed package.json must not export ./server")
+              process.exit(1)
+            }
+            if (!pkg.exports || !Object.prototype.hasOwnProperty.call(pkg.exports, "./tui")) {
+              console.error("Error: packed package.json must export ./tui")
+              process.exit(1)
+            }
+          ' "$RUNNER_TEMP/packed-package.json"

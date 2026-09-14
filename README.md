@@ -90,6 +90,8 @@ npm run build    # tsup + Solid universal 変換で dist/index.js を生成
 
 ## 既知の制限
 
+本パッケージは OpenCode が動的 import する TUI プラグインであり、TypeScript から直接 import する用途は想定していないため、型宣言は同梱していない。
+
 OpenCode 1.18.30 の `tokens.input` は、既にキャッシュ読み出し分を除いた入力トークン数である。Anthropic / OpenAI / Google / Bedrock のように `cached_tokens` を報告するプロバイダでは、この値から Prefill 速度を正しく算出できる。
 
 一方、`cached_tokens` を報告しないプロバイダでは、`tokens.input` が全プロンプトトークンになることがある。実測したローカル vLLM では次の結果となり、キャッシュによって TTFT だけが短縮されたため Prefill 速度が膨張した。

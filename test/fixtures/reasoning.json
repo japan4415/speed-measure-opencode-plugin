@@ -1,0 +1,72 @@
+[
+  {
+    "id": "evt-reasoning-step-started",
+    "type": "session.next.step.started",
+    "properties": {
+      "sessionID": "reasoning-session",
+      "assistantMessageID": "reasoning-message",
+      "timestamp": 1000,
+      "agent": "default",
+      "model": { "id": "deepseek-v4.1-flash", "providerID": "vllm" }
+    }
+  },
+  {
+    "id": "evt-reasoning-started",
+    "type": "session.next.reasoning.started",
+    "properties": {
+      "sessionID": "reasoning-session",
+      "assistantMessageID": "reasoning-message",
+      "reasoningID": "reasoning-1",
+      "timestamp": 1200
+    }
+  },
+  {
+    "id": "evt-reasoning-delta",
+    "type": "session.next.reasoning.delta",
+    "properties": {
+      "sessionID": "reasoning-session",
+      "assistantMessageID": "reasoning-message",
+      "reasoningID": "reasoning-1",
+      "timestamp": 1300,
+      "delta": "Consider the request."
+    }
+  },
+  {
+    "id": "evt-reasoning-text-started",
+    "type": "session.next.text.started",
+    "properties": {
+      "sessionID": "reasoning-session",
+      "assistantMessageID": "reasoning-message",
+      "textID": "text-1",
+      "timestamp": 1500
+    }
+  },
+  {
+    "id": "evt-reasoning-text-delta",
+    "type": "session.next.text.delta",
+    "properties": {
+      "sessionID": "reasoning-session",
+      "assistantMessageID": "reasoning-message",
+      "textID": "text-1",
+      "timestamp": 1600,
+      "delta": "Here is the answer."
+    }
+  },
+  {
+    "id": "evt-reasoning-step-ended",
+    "type": "session.next.step.ended",
+    "properties": {
+      "sessionID": "reasoning-session",
+      "assistantMessageID": "reasoning-message",
+      "timestamp": 3200,
+      "finish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 100,
+        "output": 80,
+        "reasoning": 20,
+        "cache": { "read": 0, "write": 0 }
+      }
+    }
+  }
+]

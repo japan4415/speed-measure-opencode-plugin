@@ -1,4 +1,13 @@
+// @ts-expect-error untyped node module
+import fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
+// @ts-expect-error untyped package
+import { transformSync } from "@babel/core";
+// @ts-expect-error untyped package
+import solidPreset from "babel-preset-solid";
+import * as solidJs from "solid-js";
+import * as collectorModule from "../src/collector.js";
+import * as formatModule from "../src/format.js";
 
 let rootDisposeSpy: ReturnType<typeof vi.fn> | undefined;
 
@@ -3270,3 +3279,449 @@ function harnessEmitBoth(harness: ReturnType<typeof createApiHarness>) {
     });
   }
 }
+
+describe("SolidJS reactivity verification (BB1)", () => {
+  async function loadReactivePlugin() {
+    // @ts-expect-error untyped internal module
+    const solidDev = (await import("solid-js/dist/dev.js")) as any;
+    const srcUrl = new URL("../src/index.tsx", import.meta.url);
+    const srcCode = fs.readFileSync(srcUrl, "utf8");
+
+    const transformed = transformSync(srcCode, {
+      configFile: false,
+      babelrc: false,
+      presets: [
+        ["@babel/preset-typescript", { jsxPragma: "preserve" }],
+        [solidPreset, { moduleName: "@opentui/solid", generate: "universal" }],
+      ],
+      filename: "src/index.tsx",
+    });
+
+    const cjs = transformSync(transformed!.code!, {
+      configFile: false,
+      babelrc: false,
+      plugins: [
+        ["@babel/plugin-transform-modules-commonjs", { importInterop: "none" }],
+      ],
+      filename: "src/index.js",
+    });
+
+    const opentuiSolid: any = {
+      render(code: () => any, element: any) {
+        let disposer: any;
+        solidDev.createRoot((dispose: any) => {
+          disposer = dispose;
+          opentuiSolid.insert(element, code());
+        });
+        return disposer;
+      },
+      insert(parent: any, accessor: any) {
+        if (typeof accessor !== "function") {
+          parent.children.push(accessor);
+          return;
+        }
+        const textNode = { type: "#text", value: "" };
+        parent.children.push(textNode);
+        solidDev.createEffect(() => {
+          textNode.value = String(accessor() ?? "");
+        });
+      },
+      effect(fn: (prev: any) => any, initial: any) {
+        let prev = initial;
+        solidDev.createEffect(() => {
+          prev = fn(prev);
+        });
+      },
+      createElement(type: string) {
+        return { type, props: {}, children: [] as any[], parent: null };
+      },
+      createTextNode(value: string | number) {
+        return { type: "#text", value: String(value), children: [] as any[], parent: null };
+      },
+      insertNode(parent: any, node: any) {
+        node.parent = parent;
+        parent.children.push(node);
+      },
+      setProp(node: any, name: string, value: any) {
+        node.props[name] = value;
+        return value;
+      },
+      spread() {},
+      mergeProps: solidDev.mergeProps,
+      memo: solidDev.createMemo,
+      createComponent: solidDev.createComponent,
+      use(fn: any, element: any, arg: any) {
+        return fn(element, arg);
+      },
+    };
+
+    const customRequire = (specifier: string) => {
+      if (specifier === "solid-js") return solidDev;
+      if (specifier === "@opentui/solid") return opentuiSolid;
+      if (specifier === "./collector.js") return collectorModule;
+      if (specifier === "./format.js") return formatModule;
+      throw new Error(`Cannot resolve ${specifier}`);
+    };
+
+    const moduleObj = { exports: {} as any };
+    const fn = new Function("exports", "require", "module", cjs!.code!);
+    fn(moduleObj.exports, customRequire, moduleObj);
+
+    return {
+      plugin: moduleObj.exports.default as typeof plugin,
+      solid: solidDev,
+    };
+  }
+
+  function flatten(node: any, out: string[] = []): string[] {
+    if (node.type === "#text") out.push(node.value);
+    for (const c of node.children ?? []) flatten(c, out);
+    return out;
+  }
+
+  it("updates the same rendered tree when signals change without re-calling sidebar_content", async () => {
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const root: { type: string; props: Record<string, unknown>; children: any[]; parent: null } = {
+      type: "root",
+      props: {},
+      children: [],
+      parent: null,
+    };
+    const ctx = { theme: { current: { text: "white", textMuted: "gray" } } };
+
+    // Render ONCE inside createRoot
+    let disposeRender!: () => void;
+    solidDev.createRoot((dispose: any) => {
+      disposeRender = dispose;
+      const element = harness.registration()!.slots.sidebar_content(ctx, { session_id: "sess-A" });
+      root.children.push(element);
+    });
+    await Promise.resolve();
+
+    // Initial state (idle)
+    expect(flatten(root)).toEqual(["Speed", "Prefill: --", "Decode:  --"]);
+
+    // Step started -> prefilling
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+    await Promise.resolve();
+    expect(flatten(root)).toEqual(["Speed", "Prefill: …", "Decode:  --"]);
+
+    // Text started -> decoding
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-1",
+      textID: "txt-1",
+      timestamp: 1_250,
+    });
+    await Promise.resolve();
+    expect(flatten(root)).toEqual(["Speed", "Prefill: 250 ms", "Decode:  …"]);
+
+    // Step ended -> done
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-1",
+      timestamp: 2_250,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    await Promise.resolve();
+    const doneText = flatten(root);
+    expect(doneText[0]).toBe("Speed");
+    expect(doneText[1]).toMatch(/^Prefill: 250 ms/);
+    expect(doneText[2]).toBe("Decode:  50 tok/s");
+
+    disposeRender();
+    await harness.dispose();
+  });
+
+  it("reactively updates theme colors on the existing tree without re-calling sidebar_content", async () => {
+    const { plugin: reactivePlugin, solid: solidDev } = await loadReactivePlugin();
+    const harness = createApiHarness();
+    await reactivePlugin.tui(harness.api);
+
+    const root: { type: string; props: Record<string, unknown>; children: any[]; parent: null } = {
+      type: "root",
+      props: {},
+      children: [],
+      parent: null,
+    };
+    const [theme, setTheme] = solidDev.createSignal({ text: "white", textMuted: "gray" });
+    const ctx = {
+      theme: {
+        get current() {
+          return theme();
+        },
+      },
+    };
+
+    // Render ONCE inside createRoot
+    let disposeRender!: () => void;
+    solidDev.createRoot((dispose: any) => {
+      disposeRender = dispose;
+      const element = harness.registration()!.slots.sidebar_content(ctx, { session_id: "sess-A" });
+      root.children.push(element);
+    });
+    await Promise.resolve();
+
+    const box = root.children[0] as any;
+    expect(box.type).toBe("box");
+    expect(box.children.map((c: any) => c.props.fg)).toEqual(["white", "gray", "gray"]);
+
+    // Update theme reactively
+    setTheme({ text: "cyan", textMuted: "darkgray" });
+    await Promise.resolve();
+    expect(box.children.map((c: any) => c.props.fg)).toEqual(["cyan", "darkgray", "darkgray"]);
+
+    disposeRender();
+    await harness.dispose();
+  });
+});
+
+describe("in-memory session averages separation (BB2)", () => {
+  it("uses requested session's own averages from memory when extras.averages is undefined", () => {
+    const state: CollectorState = new Map([
+      [
+        "sess-A",
+        {
+          current: {
+            phase: "done" as const,
+            sessionID: "sess-A",
+            ttft: 100,
+            prefillTokPerSec: 200,
+            decodeTokPerSec: 10,
+          },
+          stepHistory: [
+            {
+              phase: "done" as const,
+              sessionID: "sess-A",
+              ttft: 100,
+              prefillTokPerSec: 200,
+              decodeTokPerSec: 10,
+            },
+          ],
+        },
+      ],
+      [
+        "sess-B",
+        {
+          current: {
+            phase: "done" as const,
+            sessionID: "sess-B",
+            ttft: 900,
+            prefillTokPerSec: 200,
+            decodeTokPerSec: 90,
+          },
+          stepHistory: [
+            {
+              phase: "done" as const,
+              sessionID: "sess-B",
+              ttft: 900,
+              prefillTokPerSec: 200,
+              decodeTokPerSec: 90,
+            },
+          ],
+        },
+      ],
+    ]) as unknown as CollectorState;
+
+    const config: SpeedMeasureConfig = {
+      ...DEFAULT_CONFIG,
+      showAverages: true,
+      showTTFT: true,
+    };
+
+    // extras.averages is undefined -> calculateSessionAverages(state.get(sessionID))
+    const linesB = buildDisplayLines(state, "sess-B", config, {});
+    expect(linesB.decode).toBe("Decode:  90 (avg 90) tok/s");
+    expect(linesB.prefill).toContain("900 ms (avg 900 ms)");
+
+    const linesA = buildDisplayLines(state, "sess-A", config, {});
+    expect(linesA.decode).toBe("Decode:  10 (avg 10) tok/s");
+    expect(linesA.prefill).toContain("100 ms (avg 100 ms)");
+  });
+
+  it("separates session averages in plugin UI when api.kv is not ready", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/Users/discord4415" },
+      file: () => ({
+        text: () =>
+          Promise.resolve(JSON.stringify({ showAverages: true, showTTFT: true })),
+      }),
+    });
+
+    const harness = createApiHarness(false); // kvReady = false
+    await plugin.tui(harness.api);
+
+    // Complete a step for sess-A
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
+      textID: "txt-A",
+      timestamp: 1_100,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
+      timestamp: 2_100,
+      tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+
+    // Complete a step for sess-B
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B",
+      textID: "txt-B",
+      timestamp: 3_900,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B",
+      timestamp: 4_900,
+      tokens: { input: 100, output: 90, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+
+    // Both sessions should display their OWN average
+    const linesB = sidebarLines(harness.registration(), "sess-B");
+    expect(linesB[2]).toBe("Decode:  90 (avg 90) tok/s");
+    expect(linesB[1]).toContain("900 ms (avg 900 ms)");
+
+    const linesA = sidebarLines(harness.registration(), "sess-A");
+    expect(linesA[2]).toBe("Decode:  10 (avg 10) tok/s");
+    expect(linesA[1]).toContain("100 ms (avg 100 ms)");
+
+    await harness.dispose();
+  });
+});
+
+describe("v1-only server dispose cleanup (BB3)", () => {
+  it("releases v1 subscriptions when disposed after fallback without any v2 events", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      // No v2 events emitted at all. Let the 2,000 ms fallback gate expire.
+      vi.advanceTimersByTime(2_000);
+
+      // v1 fallback should now be active, registering message.part.updated and message.part.delta
+      const updatedHandlers = harness.handlers.get("message.part.updated");
+      const deltaHandlers = harness.handlers.get("message.part.delta");
+      expect(updatedHandlers?.size).toBe(1);
+      expect(deltaHandlers?.size).toBe(1);
+
+      // Dispose while still in v1-only mode
+      await harness.dispose();
+
+      // Verify all unsubscriptions were called
+      expect(updatedHandlers?.size).toBe(0);
+      expect(deltaHandlers?.size).toBe(0);
+      expect(
+        harness.unsubscribeSpies.every((u) => u.mock.calls.length === 1),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("default cache value when tokens.cache is omitted (BB4)", () => {
+  it("displays cache 0 when v2 step.ended omits tokens.cache under showCache", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/Users/discord4415" },
+      file: () => ({
+        text: () => Promise.resolve(JSON.stringify({ showCache: true })),
+      }),
+    });
+
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-1",
+      textID: "txt-1",
+      timestamp: 1_200,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-1",
+      timestamp: 2_200,
+      tokens: { input: 100, output: 50, reasoning: 0 }, // cache omitted!
+    });
+
+    const lines = sidebarLines(harness.registration(), "sess-A");
+    expect(lines[1]).toMatch(/│ cache 0$/);
+
+    await harness.dispose();
+  });
+
+  it("displays cache 0 when v1 step-finish omits tokens.cache under showCache", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("Bun", {
+        env: { HOME: "/Users/discord4415" },
+        file: () => ({
+          text: () => Promise.resolve(JSON.stringify({ showCache: true })),
+        }),
+      });
+
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      vi.advanceTimersByTime(2_000);
+
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-start",
+          sessionID: "sess-A",
+          messageID: "msg-1",
+        },
+      });
+      vi.advanceTimersByTime(200);
+      harness.emit("message.part.delta", {
+        sessionID: "sess-A",
+        messageID: "msg-1",
+        field: "text",
+        delta: "hello world",
+      });
+      vi.advanceTimersByTime(800);
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-finish",
+          sessionID: "sess-A",
+          messageID: "msg-1",
+          tokens: { input: 100, output: 50, reasoning: 0 }, // cache omitted!
+        },
+      });
+
+      const lines = sidebarLines(harness.registration(), "sess-A");
+      expect(lines[1]).toMatch(/│ cache 0$/);
+
+      await harness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+

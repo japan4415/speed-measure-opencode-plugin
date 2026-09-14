@@ -9,9 +9,6 @@
   "files": [
     "dist"
   ],
-  "engines": {
-    "node": "^20.19.0 || >=22.12.0"
-  },
   "scripts": {
     "build": "tsup && node scripts/transform-solid.mjs",
     "prepack": "npm run build",

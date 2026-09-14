@@ -36,12 +36,13 @@ opencode plugin speed-measure-opencode-plugin         # プロジェクト単位
 
 #### 更新手順
 
-OpenCode は bare `latest` を自動再取得しないため、プラグインの更新はバージョンを明示して `--force` で上書きします。
+OpenCode 1.18.30 では、`--force` は設定内の同名プラグイン指定を、明示的な npm dist-tag 指定である `@latest` に置き換えます。
+ただし、`@latest` の管理キャッシュが既にある場合は再利用されるため、このコマンドを繰り返すだけで毎回 npm から再取得するわけではありません。
 導入時に選んだ scope に対応するコマンドを実行してください。
 
 ```bash
-opencode plugin speed-measure-opencode-plugin@0.1.0 -g --force  # グローバル設定を更新
-opencode plugin speed-measure-opencode-plugin@0.1.0 --force     # プロジェクト設定を更新
+opencode plugin speed-measure-opencode-plugin@latest -g --force  # グローバル設定を更新
+opencode plugin speed-measure-opencode-plugin@latest --force     # プロジェクト設定を更新
 ```
 
 ### 代替（ソースから）

@@ -2,5 +2,29 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "solid-js は @opentui/solid が exact peerDependency (1.9.12) を要求するため更新を無効化",
+      "matchPackageNames": [
+        "solid-js"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "@opentui/solid は OpenCode ランタイムおよび Solid universal レンダラーとの互換性維持のため更新を無効化",
+      "matchPackageNames": [
+        "@opentui/solid"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "@opencode-ai/plugin と @opencode-ai/sdk は OpenCode プラグインランタイム要件に合わせ 1.18.30 に固定するため更新を無効化",
+      "matchPackageNames": [
+        "@opencode-ai/plugin",
+        "@opencode-ai/sdk"
+      ],
+      "enabled": false
+    }
   ]
 }

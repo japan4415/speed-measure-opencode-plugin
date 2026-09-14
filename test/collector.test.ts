@@ -1151,6 +1151,91 @@ describe("SpeedCollector", () => {
     });
   });
 
+  it("preserves accumulated characters across chained ticks and an interleaved delta", () => {
+    const collector = new SpeedCollector();
+    let state = collector.onStepStarted(
+      new Map(),
+      ev.stepStarted("s1", -200)
+    );
+    state = collector.onTextStarted(state, ev.textStarted(0));
+    state = collector.onTextDelta(state, ev.textDelta("1234567890"));
+
+    state = collector.tick(state, 1000);
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "decoding",
+      liveChars: 10,
+      liveEstimate: 10,
+    });
+
+    state = collector.tick(state, 2000);
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "decoding",
+      liveChars: 10,
+      liveEstimate: 5,
+    });
+
+    state = collector.onTextDelta(state, ev.textDelta("12345"));
+    state = collector.tick(state, 3000);
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "decoding",
+      liveChars: 15,
+      liveEstimate: 5,
+    });
+  });
+
+  it("chains ticks and deltas independently across concurrent sessions", () => {
+    const collector = new SpeedCollector();
+    let state: CollectorState = new Map();
+    state = collector.onStepStarted(state, ev.stepStarted("text", -200));
+    state = collector.onTextStarted(state, ev.textStarted(0, "text"));
+    state = collector.onTextDelta(
+      state,
+      ev.textDelta("1234567890", "text")
+    );
+    state = collector.onStepStarted(
+      state,
+      ev.stepStarted("reasoning", 300)
+    );
+    state = collector.onReasoningStarted(
+      state,
+      ev.reasoningStarted(500, "reasoning")
+    );
+    state = collector.onReasoningDelta(
+      state,
+      ev.reasoningDelta("123456789", "reasoning")
+    );
+
+    state = collector.tick(state, 1000);
+    expect(state.get("text")?.current).toMatchObject({
+      phase: "decoding",
+      liveChars: 10,
+      liveEstimate: 10,
+    });
+    expect(state.get("reasoning")?.current).toMatchObject({
+      phase: "decoding",
+      liveChars: 9,
+      liveEstimate: 18,
+    });
+
+    state = collector.onTextDelta(state, ev.textDelta("12345", "text"));
+    state = collector.onReasoningDelta(
+      state,
+      ev.reasoningDelta("123", "reasoning")
+    );
+    state = collector.tick(state, 2000);
+
+    expect(state.get("text")?.current).toMatchObject({
+      phase: "decoding",
+      liveChars: 15,
+      liveEstimate: 7.5,
+    });
+    expect(state.get("reasoning")?.current).toMatchObject({
+      phase: "decoding",
+      liveChars: 12,
+      liveEstimate: 8,
+    });
+  });
+
   it("onIdle selects the requested session even when another session is first", () => {
     const collector = new SpeedCollector();
     const other = stateAtPhase("prefilling", "map-first").get("map-first");

@@ -2017,6 +2017,4 @@ describe("SpeedCollector", () => {
       decodeTokPerSec: 50,
     });
   });
-
-  it.todo("tests v1 fallback after Issue #7 implements the plugin entry and 2s timeout");
 });

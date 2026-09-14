@@ -1497,34 +1497,24 @@ describe("SpeedCollector", () => {
     });
   });
 
-  it("subtracts positive cache.read tokens from the prefill numerator", () => {
-    const collector = new SpeedCollector();
-    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
-    state = collector.onTextStarted(state, ev.textStarted(1500));
-    const ended = ev.stepEnded(2500, 10, 0, 100);
-    ended.tokens.cache.read = 40;
-    state = collector.onStepEnded(state, ended);
-
-    expect(state.get("s1")?.current).toMatchObject({
-      phase: "done",
-      prefillTokPerSec: 120,
-    });
-  });
-
-  it.each([100, 101])(
-    "returns null when cache.read %i leaves no effective input tokens",
-    (cacheRead) => {
+  it.each([
+    [800, 4_000, 300, 8_000 / 3],
+    [12, 20_000, 400, 30],
+  ] as const)(
+    "uses non-cached input directly when input=%i and cache.read=%i",
+    (inputTokens, cacheRead, ttft, expected) => {
       const collector = new SpeedCollector();
       let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
-      state = collector.onTextStarted(state, ev.textStarted(1500));
-      const ended = ev.stepEnded(2500, 10, 0, 100);
+      state = collector.onTextStarted(state, ev.textStarted(1000 + ttft));
+      const ended = ev.stepEnded(2000, 10, 0, inputTokens);
       ended.tokens.cache.read = cacheRead;
       state = collector.onStepEnded(state, ended);
 
-      expect(state.get("s1")?.current).toMatchObject({
-        phase: "done",
-        prefillTokPerSec: null,
-      });
+      const current = state.get("s1")?.current;
+      expect(current?.phase).toBe("done");
+      expect(current?.phase === "done" && current.prefillTokPerSec).toBeCloseTo(
+        expected,
+      );
     },
   );
 
@@ -1568,6 +1558,19 @@ describe("SpeedCollector", () => {
       });
     },
   );
+
+  it("rejects the observed 18,517 tokens in 19 ms outlier", () => {
+    const collector = new SpeedCollector();
+    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+    state = collector.onTextStarted(state, ev.textStarted(19));
+    state = collector.onStepEnded(state, ev.stepEnded(1000, 1, 0, 18_517));
+
+    expect(18_517 / 0.019).toBeGreaterThan(MAX_PREFILL_TOK_PER_SEC);
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "done",
+      prefillTokPerSec: null,
+    });
+  });
 
   it.each([
     ["ttft just below zero", -Number.MIN_VALUE, 1, null],

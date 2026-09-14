@@ -27,7 +27,7 @@ export type DoneState = {
   phase: "done";
   sessionID: string;
   ttft: number;
-  prefillTokPerSec: number | null; // null = tokens.input が 0 またはフォールバック
+  prefillTokPerSec: number | null; // null = input/TTFT が非正または閾値超過
   decodeTokPerSec: number;
 };
 

@@ -1498,16 +1498,18 @@ describe("SpeedCollector", () => {
   });
 
   it.each([
-    [800, 4_000, 300, 8_000 / 3],
-    [12, 20_000, 400, 30],
+    [800, 4_000, 0, 300, 8_000 / 3],
+    [12, 20_000, 0, 400, 30],
+    [800, 0, 300, 300, 8_000 / 3],
   ] as const)(
-    "uses non-cached input directly when input=%i and cache.read=%i",
-    (inputTokens, cacheRead, ttft, expected) => {
+    "uses input directly when input=%i, cache.read=%i, and cache.write=%i",
+    (inputTokens, cacheRead, cacheWrite, ttft, expected) => {
       const collector = new SpeedCollector();
       let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
       state = collector.onTextStarted(state, ev.textStarted(1000 + ttft));
       const ended = ev.stepEnded(2000, 10, 0, inputTokens);
       ended.tokens.cache.read = cacheRead;
+      ended.tokens.cache.write = cacheWrite;
       state = collector.onStepEnded(state, ended);
 
       const current = state.get("s1")?.current;

@@ -21,7 +21,7 @@
   - `cached_tokens` を報告しないプロバイダ（実測したローカル vLLM など）では `tokens.input` が全プロンプトトークンになる一方、キャッシュにより TTFT だけが短縮されるため、Prefill 速度が過大になる
   - `tokens.input <= 0` の場合、または算出値が `500,000 tok/s` を超える場合は速度を利用不能（`null`）とし、TTFT のみ表示する。上限値は極端な異常値を抑える緩和策であり、キャッシュ歪みの完全な検出手段ではない
   - `showCache: true` 設定時は `tokens.cache.read` を副表示として別途示す
-  - `tokens.cache.write` は `tokens.input` に含まれると想定（vLLM は実機確認要）
+  - `tokens.cache.write` も `tokens.input` とは互いに素であり、合計トークン数では独立した加算項として扱う
 
 **Decode（出力生成フェーズ）**
 

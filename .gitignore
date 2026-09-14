@@ -3,3 +3,4 @@ node_modules/
 dist/
 .tsup-out/
 .workflow-runs/
+*.tgz

@@ -5,9 +5,10 @@
   ],
   "packageRules": [
     {
-      "description": "solid-js は @opentui/solid が exact peerDependency (1.9.12) を要求するため更新を無効化",
+      "description": "solid-js と babel-preset-solid は @opentui/solid が exact 1.9.12 を要求し universal JSX 変換との整合が必要なため更新を無効化",
       "matchPackageNames": [
-        "solid-js"
+        "solid-js",
+        "babel-preset-solid"
       ],
       "enabled": false
     },
@@ -19,7 +20,7 @@
       "enabled": false
     },
     {
-      "description": "@opencode-ai/plugin と @opencode-ai/sdk は OpenCode プラグインランタイム要件に合わせ 1.18.30 に固定するため更新を無効化",
+      "description": "開発時に使う @opencode-ai/plugin と @opencode-ai/sdk は 1.18.30 に固定し、plugin の peerDependency は利用側互換性のため >=1.15.0 とするため更新を無効化",
       "matchPackageNames": [
         "@opencode-ai/plugin",
         "@opencode-ai/sdk"

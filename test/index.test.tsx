@@ -25,10 +25,12 @@ vi.mock("solid-js", async (importOriginal) => {
   };
 });
 
-import type {
-  CollectorState,
-  DoneState,
-  SessionMetrics,
+import {
+  MAX_PREFILL_TOK_PER_SEC,
+  SpeedCollector,
+  type CollectorState,
+  type DoneState,
+  type SessionMetrics,
 } from "../src/collector.js";
 import {
   CONFIG_PATH,
@@ -352,6 +354,39 @@ describe("buildDisplayLines", () => {
     });
   });
 
+  it.each([
+    [MAX_PREFILL_TOK_PER_SEC, `Prefill: 1000 ms │ 500k tok/s`],
+    [MAX_PREFILL_TOK_PER_SEC + 1, "Prefill: 1000 ms"],
+  ] as const)(
+    "renders the expected Prefill line at the threshold boundary for %i tok/s",
+    (inputTokens, expectedPrefill) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), {
+        sessionID: "sess-A",
+        assistantMessageID: "message-1",
+        timestamp: 0,
+      });
+      state = collector.onTextStarted(state, {
+        sessionID: "sess-A",
+        assistantMessageID: "message-1",
+        timestamp: 1000,
+      });
+      state = collector.onStepEnded(state, {
+        sessionID: "sess-A",
+        assistantMessageID: "message-1",
+        timestamp: 2000,
+        tokens: {
+          input: inputTokens,
+          output: 1,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+      });
+
+      expect(buildDisplayLines(state, "sess-A").prefill).toBe(expectedPrefill);
+    },
+  );
+
   it("honors non-default cache and TTFT display gates", () => {
     const done = {
       phase: "done" as const,
@@ -380,6 +415,26 @@ describe("buildDisplayLines", () => {
         { cacheRead: 512 },
       ).prefill,
     ).toBe("Prefill: 2.1k tok/s");
+  });
+
+  it("shows a placeholder when both TTFT and prefill speed are unavailable", () => {
+    const done = {
+      phase: "done" as const,
+      sessionID: "sess-A",
+      ttft: 19,
+      prefillTokPerSec: null,
+      decodeTokPerSec: 58.3,
+    };
+    const state: CollectorState = new Map([
+      ["sess-A", { current: done, stepHistory: [done] }],
+    ]);
+
+    expect(
+      buildDisplayLines(state, "sess-A", {
+        ...DEFAULT_CONFIG,
+        showTTFT: false,
+      }).prefill,
+    ).toBe("Prefill: --");
   });
 
   it("hides TTFT while decoding when showTTFT is false", () => {

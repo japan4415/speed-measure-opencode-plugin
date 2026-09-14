@@ -1,13 +1,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+let rootDisposeSpy: ReturnType<typeof vi.fn> | undefined;
+
+vi.mock("solid-js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("solid-js")>();
+  return {
+    ...actual,
+    createRoot: (fn: (dispose: () => void) => any) => {
+      return actual.createRoot((dispose) => {
+        const spy = vi.fn(dispose);
+        rootDisposeSpy = spy;
+        return fn(spy);
+      });
+    },
+  };
+});
+
 import type { CollectorState } from "../src/collector.js";
 import {
   DEFAULT_CONFIG,
   buildDisplayLines,
+  loadConfig,
   parseConfig,
   scheduleV1Fallback,
 } from "../src/index.js";
 import plugin from "../src/index.js";
+
+
 
 const V2_EVENT_NAMES = [
   "session.next.step.started",
@@ -333,6 +352,37 @@ describe("parseConfig", () => {
   });
 });
 
+describe("loadConfig", () => {
+  it("returns default config when file read rejects or throws (file absent, permission error)", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/test-home" },
+      file: vi.fn(() => ({
+        text: vi.fn().mockRejectedValue(new Error("ENOENT: no such file or directory")),
+      })),
+    });
+    const config = await loadConfig();
+    expect(config).toEqual(DEFAULT_CONFIG);
+  });
+
+  it("returns default config when Bun.file synchronously throws", async () => {
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/test-home" },
+      file: vi.fn(() => {
+        throw new Error("EACCES: permission denied");
+      }),
+    });
+    const config = await loadConfig();
+    expect(config).toEqual(DEFAULT_CONFIG);
+  });
+
+  it("returns default config when runtimeBun is undefined", async () => {
+    vi.stubGlobal("Bun", undefined);
+    const config = await loadConfig();
+    expect(config).toEqual(DEFAULT_CONFIG);
+  });
+});
+
+
 describe("scheduleV1Fallback", () => {
   it("activates v1 only after two seconds without a v2 step", () => {
     vi.useFakeTimers();
@@ -533,4 +583,473 @@ describe("plugin.tui", () => {
       ),
     ).toBe(true);
   });
+
+  it("calls Solid root dispose when onDispose is triggered", async () => {
+    vi.useFakeTimers();
+    rootDisposeSpy = undefined;
+
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    expect(rootDisposeSpy).toBeDefined();
+    expect(rootDisposeSpy).not.toHaveBeenCalled();
+
+    await harness.dispose();
+
+    expect(rootDisposeSpy).toHaveBeenCalledOnce();
+  });
+
+  it("initializes with default config without throwing when config file read rejects", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/test-home" },
+      file: vi.fn(() => ({
+        text: vi.fn().mockRejectedValue(new Error("ENOENT: file not found")),
+      })),
+    });
+    const harness = createApiHarness();
+    await expect(plugin.tui(harness.api)).resolves.not.toThrow();
+
+    expect(harness.registration()?.order).toBe(150);
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: --",
+      "Decode:  --",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("applies custom configuration (order and liveIntervalMs)", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({
+      order: 250,
+      liveIntervalMs: 300,
+    });
+    const harness = createApiHarness();
+    await configured.tui(harness.api);
+
+    expect(harness.registration()?.order).toBe(250);
+
+    vi.setSystemTime(10_000);
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_000,
+    });
+    harness.emit("session.next.text.delta", {
+      sessionID: "session-1",
+      delta: "123456789012345678901234567890",
+    });
+
+    vi.advanceTimersByTime(250);
+    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  …");
+
+    vi.advanceTimersByTime(50);
+    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  ~100 tok/s");
+
+    await harness.dispose();
+  });
+
+  it("updates display to prefilling on session.next.step.started", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: …",
+      "Decode:  --",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("transitions to decoding with reasoning timestamp on session.next.reasoning.started", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+
+    harness.emit("session.next.reasoning.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      reasoningID: "reason-1",
+      timestamp: 1_250,
+    });
+
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: 250 ms",
+      "Decode:  …",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("transitions to decoding on session.next.text.started", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+
+    harness.emit("session.next.text.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      textID: "text-1",
+      timestamp: 1_400,
+    });
+
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: 400 ms",
+      "Decode:  …",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("accumulates live chars and updates live estimate on session.next.reasoning.delta", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_000,
+    });
+    harness.emit("session.next.reasoning.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_000,
+    });
+
+    harness.emit("session.next.reasoning.delta", {
+      sessionID: "session-1",
+      delta: "12345678901234567890", // 20 chars
+    });
+
+    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  …");
+
+    // Default liveIntervalMs is 150ms. At 150ms, elapsed = 0.15s: 20 chars / 0.15s = 133.3 tok/s
+    vi.advanceTimersByTime(150);
+    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  ~133.3 tok/s");
+
+    await harness.dispose();
+  });
+
+  it("accumulates live chars and updates live estimate on session.next.text.delta", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 10_000,
+    });
+
+    harness.emit("session.next.text.delta", {
+      sessionID: "session-1",
+      delta: "123456789012345678901234567890", // 30 chars
+    });
+
+    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  …");
+
+    // Default liveIntervalMs is 150ms. At 150ms, elapsed = 0.15s: 30 chars / 0.15s = 200 tok/s
+    vi.advanceTimersByTime(150);
+    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  ~200 tok/s");
+
+    await harness.dispose();
+  });
+
+
+  it("finalizes measurements on session.next.step.ended", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_500,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 2_500,
+      tokens: {
+        input: 100,
+        output: 60,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+    });
+
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: 500 ms │ 200 tok/s",
+      "Decode:  60 tok/s",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("transitions to error on session.next.step.failed", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+
+    harness.emit("session.next.step.failed", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      error: new Error("step execution failed"),
+    });
+
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("handles session.status: resets in-flight steps to idle and preserves done/error steps", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    // 1. prefilling -> idle
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: …");
+
+    harness.emit("session.status", {
+      sessionID: "session-1",
+      status: { type: "running" },
+    });
+    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: …");
+
+    harness.emit("session.status", {
+      sessionID: "session-1",
+      status: { type: "idle" },
+    });
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: --",
+      "Decode:  --",
+    ]);
+
+    // 2. decoding -> idle
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-2",
+      timestamp: 2_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-2",
+      timestamp: 2_300,
+    });
+    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: 300 ms");
+
+    harness.emit("session.status", {
+      sessionID: "session-1",
+      status: { type: "idle" },
+    });
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: --",
+      "Decode:  --",
+    ]);
+
+    // 3. done -> stays done on idle
+    emitCompletedV2(harness, "session-1");
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: 500 ms │ 200 tok/s",
+      "Decode:  60 tok/s",
+    ]);
+    harness.emit("session.status", {
+      sessionID: "session-1",
+      status: { type: "idle" },
+    });
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: 500 ms │ 200 tok/s",
+      "Decode:  60 tok/s",
+    ]);
+
+    // 4. error -> stays error on idle
+    harness.emit("session.next.step.failed", {
+      sessionID: "session-1",
+      error: "failed",
+    });
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+    harness.emit("session.status", {
+      sessionID: "session-1",
+      status: { type: "idle" },
+    });
+    expect(sidebarLines(harness.registration())).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("transitions to error on session.error for targeted session and all in-flight when sessionID is absent", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    // 1. targeted sessionID
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: …");
+
+    harness.emit("session.error", {
+      sessionID: "session-1",
+      error: "Network disconnect",
+    });
+    expect(sidebarLines(harness.registration(), "session-1")).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+
+    // 2. sessionID is undefined/null -> affects in-flight sessions
+    harness.emit("session.next.step.started", {
+      sessionID: "session-2",
+      assistantMessageID: "msg-2",
+      timestamp: 2_000,
+    });
+    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: …");
+
+    harness.emit("session.error", {
+      error: "Global process crash",
+    });
+    expect(sidebarLines(harness.registration(), "session-2")).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("records and displays cache read count on step.ended when showCache is enabled", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({ showCache: true });
+    const harness = createApiHarness();
+    await configured.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 1_500,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "session-1",
+      assistantMessageID: "msg-1",
+      timestamp: 2_500,
+      tokens: {
+        input: 100,
+        output: 60,
+        reasoning: 0,
+        cache: { read: 512, write: 0 },
+      },
+    });
+
+    const lines = sidebarLines(harness.registration(), "session-1");
+    expect(lines[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 512");
+
+    await harness.dispose();
+  });
+
+  it("reads and displays persisted averages from api.kv when showAverages is enabled", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({ showAverages: true });
+    const harness = createApiHarness(true);
+
+    harness.kvGet.mockImplementation((key: string) => {
+      if (key === "speed-measure:avg:session-1:ttft") return 250;
+      if (key === "speed-measure:avg:session-1:decode") return 75;
+      if (key === "speed-measure:avg:session-1:prefill") return 1_500;
+      return undefined;
+    });
+
+    await configured.tui(harness.api);
+
+    emitCompletedV2(harness, "session-1");
+
+    const lines = sidebarLines(harness.registration(), "session-1");
+    expect(lines[1]).toContain("(avg 250 ms)");
+    expect(lines[2]).toContain("(avg 75) tok/s");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:ttft");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:decode");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:prefill");
+
+    await harness.dispose();
+  });
 });
+
+
+

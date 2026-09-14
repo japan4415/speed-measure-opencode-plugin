@@ -632,6 +632,12 @@ const handlerPhaseMatrix: HandlerMatrixCase[] = [
     changesFrom: matrixPhases,
     invoke: (collector, state) => collector.onSessionError(state, "target"),
   },
+  {
+    name: "tick",
+    expected: preserveAll,
+    changesFrom: matrixPhases,
+    invoke: (collector, state) => collector.tick(state, 1500),
+  },
 ];
 
 const handlerPhaseCases = handlerPhaseMatrix.flatMap((handler) =>
@@ -703,6 +709,18 @@ function expectedMatrixState(
       liveEstimate: null,
     });
   }
+  if (handlerName === "tick" && phase === "decoding") {
+    return withCurrent({
+      phase: "decoding",
+      sessionID: "target",
+      assistantMessageID: "msg1",
+      t0: 1000,
+      t1: 1200,
+      ttft: 200,
+      liveChars: 5,
+      liveEstimate: 5 / ((1500 - 1200) / 1000),
+    });
+  }
   if (handlerName === "onStepEnded" && phase === "prefilling") {
     return withCurrent({ phase: "idle" });
   }
@@ -762,7 +780,15 @@ describe("SpeedCollector", () => {
         if (!handler.changesFrom.includes(phase)) {
           expect(result).toBe(initial);
         }
-        expect(result.get("target")).toEqual(expectedTarget);
+        const target = result.get("target");
+        expect(target).toEqual(expectedTarget);
+        expect(target?.current).toEqual(expectedTarget?.current);
+        expect(target?.stepHistory).toEqual(expectedTarget?.stepHistory);
+        if (expectedTarget) {
+          expect(target?.stepHistory).toHaveLength(
+            expectedTarget.stepHistory.length
+          );
+        }
         expect([...result.keys()]).toEqual(
           expectedTarget && !keysBefore.includes("target")
             ? [...keysBefore, "target"]
@@ -770,8 +796,17 @@ describe("SpeedCollector", () => {
         );
         for (const [sessionID, before] of observersBefore) {
           const observer = result.get(sessionID);
+          const expectedCurrent =
+            handler.name === "tick" && before.current.phase === "decoding"
+              ? {
+                  ...before.current,
+                  liveEstimate:
+                    before.current.liveChars /
+                    ((1500 - before.current.t1) / 1000),
+                }
+              : before.current;
           expect(observer, `${sessionID} must remain registered`).toBeDefined();
-          expect(observer?.current).toEqual(before.current);
+          expect(observer?.current).toEqual(expectedCurrent);
           expect(observer?.stepHistory).toHaveLength(before.stepHistory.length);
           expect(observer?.stepHistory).toEqual(before.stepHistory);
         }

@@ -47,6 +47,9 @@ export type SessionMetrics = {
 
 export type CollectorState = Map<string, SessionMetrics>; // key = sessionID
 
+/** Values above this limit are treated as cache-distorted measurements. */
+export const MAX_PREFILL_TOK_PER_SEC = 500_000;
+
 export interface TokenUsage {
   input: number;
   output: number;
@@ -297,11 +300,21 @@ export class SpeedCollector {
       const outputTokens =
         (props.tokens?.output ?? 0) + (props.tokens?.reasoning ?? 0);
       const inputTokens = props.tokens?.input ?? 0;
+      const cacheReadTokens = props.tokens?.cache?.read ?? 0;
+      const effectiveInputTokens =
+        cacheReadTokens > 0 ? inputTokens - cacheReadTokens : inputTokens;
 
       const decodeTokPerSec =
         decodeTimeSec > 0 ? outputTokens / decodeTimeSec : 0;
+      const calculatedPrefillTokPerSec =
+        ttft > 0 && effectiveInputTokens > 0
+          ? effectiveInputTokens / (ttft / 1000)
+          : null;
       const prefillTokPerSec =
-        ttft > 0 && inputTokens > 0 ? inputTokens / (ttft / 1000) : null;
+        calculatedPrefillTokPerSec !== null &&
+        calculatedPrefillTokPerSec <= MAX_PREFILL_TOK_PER_SEC
+          ? calculatedPrefillTokPerSec
+          : null;
 
       const doneState: DoneState & { assistantMessageID?: string } = {
         phase: "done",

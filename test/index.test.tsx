@@ -25,10 +25,12 @@ vi.mock("solid-js", async (importOriginal) => {
   };
 });
 
-import type {
-  CollectorState,
-  DoneState,
-  SessionMetrics,
+import {
+  MAX_PREFILL_TOK_PER_SEC,
+  SpeedCollector,
+  type CollectorState,
+  type DoneState,
+  type SessionMetrics,
 } from "../src/collector.js";
 import {
   CONFIG_PATH,
@@ -351,6 +353,39 @@ describe("buildDisplayLines", () => {
       decode: "Decode:  58.3 tok/s",
     });
   });
+
+  it.each([
+    [MAX_PREFILL_TOK_PER_SEC, `Prefill: 1000 ms │ 500k tok/s`],
+    [MAX_PREFILL_TOK_PER_SEC + 1, "Prefill: 1000 ms"],
+  ] as const)(
+    "renders the expected Prefill line at the threshold boundary for %i tok/s",
+    (inputTokens, expectedPrefill) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), {
+        sessionID: "sess-A",
+        assistantMessageID: "message-1",
+        timestamp: 0,
+      });
+      state = collector.onTextStarted(state, {
+        sessionID: "sess-A",
+        assistantMessageID: "message-1",
+        timestamp: 1000,
+      });
+      state = collector.onStepEnded(state, {
+        sessionID: "sess-A",
+        assistantMessageID: "message-1",
+        timestamp: 2000,
+        tokens: {
+          input: inputTokens,
+          output: 1,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+      });
+
+      expect(buildDisplayLines(state, "sess-A").prefill).toBe(expectedPrefill);
+    },
+  );
 
   it("honors non-default cache and TTFT display gates", () => {
     const done = {
@@ -2259,10 +2294,10 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     expect(harness.kvSet.mock.calls).toEqual([
       ["speed-measure:avg:sess-A:ttft", 500],
       ["speed-measure:avg:sess-A:decode", 60],
-      ["speed-measure:avg:sess-A:prefill", 200],
+      ["speed-measure:avg:sess-A:prefill", 150],
       ["speed-measure:avg:sess-B:ttft", 400],
       ["speed-measure:avg:sess-B:decode", 100],
-      ["speed-measure:avg:sess-B:prefill", 500],
+      ["speed-measure:avg:sess-B:prefill", 375],
     ]);
     await harness.dispose();
   });
@@ -2463,7 +2498,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     emitCompletedV2(harness, "sess-A");
     expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
       "Speed",
-      "Prefill: 500 ms │ 200 tok/s",
+      "Prefill: 500 ms │ 150 tok/s",
       "Decode:  60 tok/s",
     ]);
     harness.emit("session.status", {
@@ -2472,7 +2507,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     });
     expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
       "Speed",
-      "Prefill: 500 ms │ 200 tok/s",
+      "Prefill: 500 ms │ 150 tok/s",
       "Decode:  60 tok/s",
     ]);
 
@@ -2523,10 +2558,10 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     );
 
     const lines1 = sidebarLines(harness.registration(), "sess-A");
-    expect(lines1[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 512");
+    expect(lines1[1]).toBe("Prefill: 500 ms │ cache 512");
 
     const lines2 = sidebarLines(harness.registration(), "sess-B");
-    expect(lines2[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 1024");
+    expect(lines2[1]).toBe("Prefill: 500 ms │ cache 1024");
 
     const lines3 = sidebarLines(harness.registration(), "sess-C");
     expect(lines3[1]).toBe("Prefill: --");
@@ -2615,7 +2650,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     emitCompletedV2(harness, "sess-A");
 
     const lines = sidebarLines(harness.registration(), "sess-A");
-    expect(lines[1]).toBe("Prefill: 200 (avg 200) tok/s");
+    expect(lines[1]).toBe("Prefill: 150 (avg 150) tok/s");
     expect(lines[1]).not.toBe("Prefill: --");
     expect(lines[2]).toBe("Decode:  60 (avg 60) tok/s");
 
@@ -2639,7 +2674,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     );
 
     const lines = sidebarLines(harness.registration(), "sess-A");
-    expect(lines[1]).toBe("Prefill: 200 (avg 200) tok/s │ cache 256");
+    expect(lines[1]).toBe("Prefill: -- │ cache 256");
     expect(lines[2]).toBe("Decode:  60 (avg 60) tok/s");
 
     await harness.dispose();

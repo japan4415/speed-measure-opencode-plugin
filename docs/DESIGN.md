@@ -16,9 +16,11 @@
   - `t1 = session.next.reasoning.started` と `session.next.text.started` のうち早い方のサーバータイムスタンプ（"first token"）
   - `session.next.reasoning.started` / `.delta` / `.ended` の存在は `types.gen.d.ts` lines 788/798/808 で確認済み。旧バージョンの OpenCode (v1.15.0 未満) では v1 fallback に切り替わる
   - 両値とも `session.next.*` イベントのサーバータイムスタンプを使用（network jitter によるクライアント側ずれを排除）
-- **Prefill 速度** = `tokens.input / (TTFT / 1000)` tok/s
-  - `tokens.input` は `session.next.step.ended` の `tokens.input`（実処理トークン数）
-  - `tokens.cache.read` は **デフォルトで除外**：KV キャッシュヒットは attention 計算を行わないため、プリフィル速度の分子に加えるのは不正確。`showCache: true` 設定時に副表示として別途示す
+- **Prefill 速度** = `effectiveInputTokens / (TTFT / 1000)` tok/s
+  - `tokens.cache.read > 0` のとき `effectiveInputTokens = tokens.input - tokens.cache.read` とし、KV キャッシュから読んだトークンを分子から除外する
+  - `tokens.cache.read` が 0 または未報告なら `effectiveInputTokens = tokens.input` とする
+  - `effectiveInputTokens <= 0` の場合、または算出値が `500,000 tok/s` を超える場合は速度を利用不能（`null`）とし、TTFT のみ表示する。上限値は正常実測 16k tok/s に約31倍の将来余裕を確保しつつ、キャッシュ起因の異常実測 882k〜974k tok/s を除外できる値である
+  - `showCache: true` 設定時は `tokens.cache.read` を副表示として別途示す
   - `tokens.cache.write` は `tokens.input` に含まれると想定（vLLM は実機確認要）
 
 **Decode（出力生成フェーズ）**
@@ -45,6 +47,7 @@ builtin の `internal:sidebar-context`（order=100）の直後、order=150 に�
 | prefilling | `Prefill: …` | `Decode:  --` |
 | decoding (ライブ) | `Prefill: 340 ms` | `Decode:  ~45.2 chars/s` |
 | done (確定) | `Prefill: 340 ms │ 2.1k tok/s` | `Decode:  58.3 tok/s` |
+| done (Prefill 速度が利用不能) | `Prefill: 340 ms` | `Decode:  58.3 tok/s` |
 | done + avg 表示 | `Prefill: 340 ms (avg 280 ms)` | `Decode:  58.3 (avg 52) tok/s` |
 | error/abort | `Prefill: error` | `Decode:  error` |
 
@@ -301,9 +304,17 @@ const decodeTimeSec = (stepEndedTs - t1) / 1000;
 const decodeTokPerSec = decodeTimeSec > 0
   ? (tokens.output + tokens.reasoning) / decodeTimeSec
   : 0;
-const prefillTokPerSec = ttft > 0 && tokens.input > 0
-  ? tokens.input / (ttft / 1000)
+const cacheReadTokens = tokens.cache?.read ?? 0;
+const effectiveInputTokens = cacheReadTokens > 0
+  ? tokens.input - cacheReadTokens
+  : tokens.input;
+const calculatedPrefillTokPerSec = ttft > 0 && effectiveInputTokens > 0
+  ? effectiveInputTokens / (ttft / 1000)
   : null;
+const prefillTokPerSec = calculatedPrefillTokPerSec !== null
+  && calculatedPrefillTokPerSec <= 500_000
+    ? calculatedPrefillTokPerSec
+    : null;
 ```
 
 ---
@@ -639,7 +650,7 @@ vLLM サーバーは `http://172-25-4-137.tailcd0071.ts.net:8888/v1` で稼働�
 | 2 | **`SolidPlugin` スロット仕様の未確認**: `@opentui/solid` はローカル未インストール（docs/research/local-sdk.md §7）。`tui.d.ts` line 5 で `import type { JSX, SolidPlugin } from "@opentui/solid"` は確認済みだが、`order` フィールドとスロット関数シグネチャ `(ctx, props) => ...` はローカル型から検証不可 | 中 | jimicze/opencode-plugin-tps の `.tsx` と `sidebar/context.tsx` の `<box>`/`<text fg={...}>` パターンをそのまま採用する |
 | 3 | **ネットワークジッター（Tailscale 経由の vLLM）**: サーバータイムスタンプ間の差分は正確だが、クライアント受信タイミングがずれる。v1 fallback の client-side `Date.now()` は特にジッターの影響を受ける | 低〜中 | v2 イベントを優先（サーバータイムスタンプはネットワーク遅延に依存しない）。数十 ms 程度のばらつきは表示上許容 |
 | 4 | **v2 イベント不在（v1.15.0 未満のバージョン）**: `session.next.*` イベントは v1.15.0 以降（docs/research/web.md §4）で追加 | 低（現在 v1.18.30） | feature-detect（§3.2）で v1 fallback に自動切り替え |
-| 5 | **`tokens.input` の定義の曖昧さ**: vLLM では `tokens.input` がキャッシュプレフィックス分を除いた数かどうかが未確認。Prefill 速度が実際より小さくなる可能性 | 低 | 実機で `tokens.cache.read > 0` のリクエストを送り、合計トークン数と照合して確認 |
+| 5 | **プレフィックスキャッシュによる Prefill 速度の過大表示（実機で確認済み）**: ローカル vLLM `deepseek-v4.1-flash` で約4,800トークンの同一プロンプトを送ると、cold TTFT は 3676ms、warm は 305ms / 310ms（約12倍高速）だった。一方、非ストリーミング usage の `prompt_tokens` は cold/warm とも 4825、`prompt_tokens_details` はともに `null` であり、キャッシュヒット後も分子が減らず TTFT だけが短縮されることを確認した。別実測では正常な DeepSeek API が 16k tok/s、異常なローカル vLLM が 882k〜974k tok/s だった | 対策済み（残余リスク: 低） | `tokens.cache.read > 0` を分子から差し引く。報告しないプロバイダでは算出値が 500,000 tok/s を超えた場合に速度を破棄して TTFT のみ表示する。閾値以下のキャッシュ歪みや、将来 500,000 tok/s を超える正当な環境を誤判定する可能性は残る |
 | 6 | **`api.slots.register` がアンレジスタ関数を返さない**: 文字列 ID のみ返却（docs/research/web.md §8）。スロットの動的削除が不可能 | 低 | プラグイン全体を `dispose` することで対処。ライフサイクル内で動的追加削除は行わない |
 
 ---

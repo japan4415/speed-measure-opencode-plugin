@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Event } from "@opencode-ai/sdk/v2";
 
 import {
+  MAX_PREFILL_TOK_PER_SEC,
   SpeedCollector,
   type CollectorState,
   type DoneState,
@@ -1496,11 +1497,83 @@ describe("SpeedCollector", () => {
     });
   });
 
+  it("subtracts positive cache.read tokens from the prefill numerator", () => {
+    const collector = new SpeedCollector();
+    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+    state = collector.onTextStarted(state, ev.textStarted(1500));
+    const ended = ev.stepEnded(2500, 10, 0, 100);
+    ended.tokens.cache.read = 40;
+    state = collector.onStepEnded(state, ended);
+
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "done",
+      prefillTokPerSec: 120,
+    });
+  });
+
+  it.each([100, 101])(
+    "returns null when cache.read %i leaves no effective input tokens",
+    (cacheRead) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+      state = collector.onTextStarted(state, ev.textStarted(1500));
+      const ended = ev.stepEnded(2500, 10, 0, 100);
+      ended.tokens.cache.read = cacheRead;
+      state = collector.onStepEnded(state, ended);
+
+      expect(state.get("s1")?.current).toMatchObject({
+        phase: "done",
+        prefillTokPerSec: null,
+      });
+    },
+  );
+
+  it.each(["zero", "unreported"] as const)(
+    "uses all input tokens when cache.read is %s",
+    (cacheRead) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+      state = collector.onTextStarted(state, ev.textStarted(1500));
+      const ended = structuredClone(
+        ev.stepEnded(2500, 10, 0, 100),
+      ) as unknown as Parameters<SpeedCollector["onStepEnded"]>[1];
+      if (cacheRead === "unreported") delete ended.tokens.cache;
+      state = collector.onStepEnded(state, ended);
+
+      expect(state.get("s1")?.current).toMatchObject({
+        phase: "done",
+        prefillTokPerSec: 200,
+      });
+    },
+  );
+
+  it.each([
+    ["just below", MAX_PREFILL_TOK_PER_SEC - 1, MAX_PREFILL_TOK_PER_SEC - 1],
+    ["at", MAX_PREFILL_TOK_PER_SEC, MAX_PREFILL_TOK_PER_SEC],
+    ["just above", MAX_PREFILL_TOK_PER_SEC + 1, null],
+  ] as const)(
+    "applies the prefill plausibility threshold %s the boundary",
+    (_label, inputTokens, expected) => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(1000));
+      state = collector.onStepEnded(
+        state,
+        ev.stepEnded(2000, 1, 0, inputTokens),
+      );
+
+      expect(state.get("s1")?.current).toMatchObject({
+        phase: "done",
+        prefillTokPerSec: expected,
+      });
+    },
+  );
+
   it.each([
     ["ttft just below zero", -Number.MIN_VALUE, 1, null],
     ["ttft at zero", 0, 1, null],
-    ["smallest positive ttft", Number.MIN_VALUE, 1, Number.POSITIVE_INFINITY],
-    ["positive sub-millisecond ttft", Number.EPSILON, 1, 1000 / Number.EPSILON],
+    ["smallest positive ttft", Number.MIN_VALUE, 1, null],
+    ["positive sub-millisecond ttft", Number.EPSILON, 1, null],
     ["ordinary positive ttft with one token", 200, 1, 5],
     ["input just below zero", 1, -Number.MIN_VALUE, null],
     ["input at zero", 1, 0, null],

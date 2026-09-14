@@ -26,7 +26,10 @@ import {
 } from "../src/index.js";
 import plugin from "../src/index.js";
 
-
+const SESSIONS = ["sess-A", "sess-B"] as const;
+type TestSession = (typeof SESSIONS)[number];
+const otherSession = (s: TestSession): TestSession =>
+  s === "sess-A" ? "sess-B" : "sess-A";
 
 const V2_EVENT_NAMES = [
   "session.next.step.started",
@@ -137,7 +140,7 @@ function textContent(value: unknown): string {
 
 function sidebarRendered(
   registration: SidebarRegistration | undefined,
-  sessionID = "session-1",
+  sessionID: string = "sess-A",
   theme: { text: string; textMuted: string } = { text: "white", textMuted: "gray" },
 ): { tree: TestElement; lines: string[]; children: TestElement[] } {
   expect(registration).toBeDefined();
@@ -166,7 +169,7 @@ function sidebarRendered(
 
 function sidebarLines(
   registration: SidebarRegistration | undefined,
-  sessionID = "session-1",
+  sessionID: string = "sess-A",
   theme?: { text: string; textMuted: string },
 ): string[] {
   return sidebarRendered(registration, sessionID, theme).lines;
@@ -174,7 +177,7 @@ function sidebarLines(
 
 function emitCompletedV2(
   harness: ReturnType<typeof createApiHarness>,
-  sessionID = "session-1",
+  sessionID: string = "sess-A",
   tokens = {
     input: 100,
     output: 60,
@@ -220,7 +223,7 @@ afterEach(() => {
 
 describe("buildDisplayLines", () => {
   it("shows placeholders for an idle session", () => {
-    expect(buildDisplayLines(new Map(), "session-1")).toEqual({
+    expect(buildDisplayLines(new Map(), "sess-A")).toEqual({
       prefill: "Prefill: --",
       decode: "Decode:  --",
     });
@@ -229,11 +232,11 @@ describe("buildDisplayLines", () => {
   it("shows a live estimate while decoding", () => {
     const state: CollectorState = new Map([
       [
-        "session-1",
+        "sess-A",
         {
           current: {
             phase: "decoding",
-            sessionID: "session-1",
+            sessionID: "sess-A",
             assistantMessageID: "message-1",
             t0: 1_000,
             t1: 1_340,
@@ -246,7 +249,7 @@ describe("buildDisplayLines", () => {
       ],
     ]);
 
-    expect(buildDisplayLines(state, "session-1")).toEqual({
+    expect(buildDisplayLines(state, "sess-A")).toEqual({
       prefill: "Prefill: 340 ms",
       decode: "Decode:  ~45.2 tok/s",
     });
@@ -255,16 +258,16 @@ describe("buildDisplayLines", () => {
   it("shows final values for a completed step", () => {
     const done = {
       phase: "done" as const,
-      sessionID: "session-1",
+      sessionID: "sess-A",
       ttft: 340,
       prefillTokPerSec: 2_100,
       decodeTokPerSec: 58.3,
     };
     const state: CollectorState = new Map([
-      ["session-1", { current: done, stepHistory: [done] }],
+      ["sess-A", { current: done, stepHistory: [done] }],
     ]);
 
-    expect(buildDisplayLines(state, "session-1")).toEqual({
+    expect(buildDisplayLines(state, "sess-A")).toEqual({
       prefill: "Prefill: 340 ms │ 2.1k tok/s",
       decode: "Decode:  58.3 tok/s",
     });
@@ -273,19 +276,19 @@ describe("buildDisplayLines", () => {
   it("honors non-default cache and TTFT display gates", () => {
     const done = {
       phase: "done" as const,
-      sessionID: "session-1",
+      sessionID: "sess-A",
       ttft: 340,
       prefillTokPerSec: 2_100,
       decodeTokPerSec: 58.3,
     };
     const state: CollectorState = new Map([
-      ["session-1", { current: done, stepHistory: [done] }],
+      ["sess-A", { current: done, stepHistory: [done] }],
     ]);
 
     expect(
       buildDisplayLines(
         state,
-        "session-1",
+        "sess-A",
         { ...DEFAULT_CONFIG, showCache: true },
         { cacheRead: 512 },
       ).prefill,
@@ -293,7 +296,7 @@ describe("buildDisplayLines", () => {
     expect(
       buildDisplayLines(
         state,
-        "session-1",
+        "sess-A",
         { ...DEFAULT_CONFIG, showTTFT: false },
         { cacheRead: 512 },
       ).prefill,
@@ -303,11 +306,11 @@ describe("buildDisplayLines", () => {
   it("hides TTFT while decoding when showTTFT is false", () => {
     const state: CollectorState = new Map([
       [
-        "session-1",
+        "sess-A",
         {
           current: {
             phase: "decoding",
-            sessionID: "session-1",
+            sessionID: "sess-A",
             assistantMessageID: "message-1",
             t0: 1_000,
             t1: 1_340,
@@ -321,7 +324,7 @@ describe("buildDisplayLines", () => {
     ]);
 
     expect(
-      buildDisplayLines(state, "session-1", {
+      buildDisplayLines(state, "sess-A", {
         ...DEFAULT_CONFIG,
         showTTFT: false,
       }).prefill,
@@ -408,7 +411,6 @@ describe("loadConfig", () => {
   });
 });
 
-
 describe("scheduleV1Fallback", () => {
   it("activates v1 only after two seconds without a v2 step", () => {
     vi.useFakeTimers();
@@ -433,8 +435,469 @@ describe("scheduleV1Fallback", () => {
   });
 });
 
-describe("plugin.tui", () => {
-  it("registers one default-order sidebar slot and all nine v2 events", async () => {
+describe("plugin.tui - event isolation cross-product matrix", () => {
+  type EventMatrixCase = {
+    name: string;
+    isV1?: boolean;
+    setup?: (
+      harness: ReturnType<typeof createApiHarness>,
+      target: TestSession,
+      other: TestSession,
+    ) => void;
+    emit: (
+      harness: ReturnType<typeof createApiHarness>,
+      target: TestSession,
+    ) => void;
+    postAdvanceMs?: number;
+    expectedTarget: { prefill: string; decode: string };
+    expectedOther: { prefill: string; decode: string };
+    postCheck?: (
+      harness: ReturnType<typeof createApiHarness>,
+      target: TestSession,
+      other: TestSession,
+    ) => void;
+  };
+
+  const V2_ISOLATION_CASES: EventMatrixCase[] = [
+    {
+      name: "v2 session.next.step.started",
+      emit: (harness, target) => {
+        harness.emit("session.next.step.started", {
+          sessionID: target,
+          assistantMessageID: `msg-${target}`,
+          timestamp: 1_000,
+        });
+      },
+      expectedTarget: { prefill: "Prefill: …", decode: "Decode:  --" },
+      expectedOther: { prefill: "Prefill: --", decode: "Decode:  --" },
+    },
+    {
+      name: "v2 session.next.reasoning.started",
+      setup: (harness, target, other) => {
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 1_000,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.next.reasoning.started", {
+          sessionID: target,
+          assistantMessageID: `msg-${target}`,
+          reasoningID: `reason-${target}`,
+          timestamp: 1_250,
+        });
+      },
+      expectedTarget: { prefill: "Prefill: 250 ms", decode: "Decode:  …" },
+      expectedOther: { prefill: "Prefill: …", decode: "Decode:  --" },
+    },
+    {
+      name: "v2 session.next.reasoning.delta",
+      setup: (harness, target, other) => {
+        vi.setSystemTime(10_000);
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 10_000,
+          });
+          harness.emit("session.next.reasoning.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            reasoningID: `reason-${s}`,
+            timestamp: 10_000,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.next.reasoning.delta", {
+          sessionID: target,
+          delta: "12345678901234567890", // 20 chars
+        });
+      },
+      postAdvanceMs: 150,
+      expectedTarget: { prefill: "Prefill: 0 ms", decode: "Decode:  ~133.3 tok/s" },
+      expectedOther: { prefill: "Prefill: 0 ms", decode: "Decode:  ~0 tok/s" },
+    },
+    {
+      name: "v2 session.next.text.started",
+      setup: (harness, target, other) => {
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 1_000,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.next.text.started", {
+          sessionID: target,
+          assistantMessageID: `msg-${target}`,
+          textID: `text-${target}`,
+          timestamp: 1_400,
+        });
+      },
+      expectedTarget: { prefill: "Prefill: 400 ms", decode: "Decode:  …" },
+      expectedOther: { prefill: "Prefill: …", decode: "Decode:  --" },
+    },
+    {
+      name: "v2 session.next.text.delta",
+      setup: (harness, target, other) => {
+        vi.setSystemTime(10_000);
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 10_000,
+          });
+          harness.emit("session.next.text.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            textID: `text-${s}`,
+            timestamp: 10_000,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.next.text.delta", {
+          sessionID: target,
+          delta: "123456789012345678901234567890", // 30 chars
+        });
+      },
+      postAdvanceMs: 150,
+      expectedTarget: { prefill: "Prefill: 0 ms", decode: "Decode:  ~200 tok/s" },
+      expectedOther: { prefill: "Prefill: 0 ms", decode: "Decode:  ~0 tok/s" },
+    },
+    {
+      name: "v2 session.next.step.ended",
+      setup: (harness, target, other) => {
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 1_000,
+          });
+          harness.emit("session.next.text.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            textID: `text-${s}`,
+            timestamp: 1_500,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.next.step.ended", {
+          sessionID: target,
+          assistantMessageID: `msg-${target}`,
+          timestamp: 2_500,
+          tokens: { input: 100, output: 60, reasoning: 0, cache: { read: 0, write: 0 } },
+        });
+      },
+      expectedTarget: { prefill: "Prefill: 500 ms │ 200 tok/s", decode: "Decode:  60 tok/s" },
+      expectedOther: { prefill: "Prefill: 500 ms", decode: "Decode:  …" },
+    },
+    {
+      name: "v2 session.next.step.failed",
+      setup: (harness, target, other) => {
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 1_000,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.next.step.failed", {
+          sessionID: target,
+          assistantMessageID: `msg-${target}`,
+          error: new Error("step failed"),
+        });
+      },
+      expectedTarget: { prefill: "Prefill: error", decode: "Decode:  error" },
+      expectedOther: { prefill: "Prefill: …", decode: "Decode:  --" },
+    },
+    {
+      name: "v2 session.status (idle)",
+      setup: (harness, target, other) => {
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 1_000,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.status", {
+          sessionID: target,
+          status: { type: "idle" },
+        });
+      },
+      expectedTarget: { prefill: "Prefill: --", decode: "Decode:  --" },
+      expectedOther: { prefill: "Prefill: …", decode: "Decode:  --" },
+    },
+    {
+      name: "v2 session.error (targeted sessionID)",
+      setup: (harness, target, other) => {
+        for (const s of [target, other]) {
+          harness.emit("session.next.step.started", {
+            sessionID: s,
+            assistantMessageID: `msg-${s}`,
+            timestamp: 1_000,
+          });
+        }
+      },
+      emit: (harness, target) => {
+        harness.emit("session.error", {
+          sessionID: target,
+          error: "targeted session error",
+        });
+      },
+      expectedTarget: { prefill: "Prefill: error", decode: "Decode:  error" },
+      expectedOther: { prefill: "Prefill: …", decode: "Decode:  --" },
+    },
+  ];
+
+  const V1_ISOLATION_CASES: EventMatrixCase[] = [
+    {
+      name: "v1 message.part.updated (step-start)",
+      isV1: true,
+      emit: (harness, target) => {
+        harness.emit("message.part.updated", {
+          part: {
+            type: "step-start",
+            sessionID: target,
+            messageID: `msg-${target}`,
+          },
+        });
+      },
+      expectedTarget: { prefill: "Prefill: …", decode: "Decode:  --" },
+      expectedOther: { prefill: "Prefill: --", decode: "Decode:  --" },
+    },
+    {
+      name: "v1 message.part.delta (text)",
+      isV1: true,
+      setup: (harness, target, other) => {
+        vi.setSystemTime(10_000);
+        for (const s of [target, other]) {
+          harness.emit("message.part.updated", {
+            part: {
+              type: "step-start",
+              sessionID: s,
+              messageID: `msg-${s}`,
+            },
+          });
+        }
+        vi.advanceTimersByTime(340);
+      },
+      emit: (harness, target) => {
+        harness.emit("message.part.delta", {
+          sessionID: target,
+          messageID: `msg-${target}`,
+          partID: `text-${target}`,
+          field: "text",
+          delta: "forty characters are enough for a sample",
+        });
+      },
+      expectedTarget: { prefill: "Prefill: 340 ms", decode: "Decode:  …" },
+      expectedOther: { prefill: "Prefill: …", decode: "Decode:  --" },
+    },
+    {
+      name: "v1 message.part.updated (step-finish)",
+      isV1: true,
+      setup: (harness, target, other) => {
+        vi.setSystemTime(10_000);
+        for (const s of [target, other]) {
+          harness.emit("message.part.updated", {
+            part: {
+              type: "step-start",
+              sessionID: s,
+              messageID: `msg-${s}`,
+            },
+          });
+        }
+        vi.advanceTimersByTime(340);
+        for (const s of [target, other]) {
+          harness.emit("message.part.delta", {
+            sessionID: s,
+            messageID: `msg-${s}`,
+            partID: `text-${s}`,
+            field: "text",
+            delta: "forty characters are enough for a sample",
+          });
+        }
+        vi.advanceTimersByTime(1_000);
+      },
+      emit: (harness, target) => {
+        harness.emit("message.part.updated", {
+          part: {
+            type: "step-finish",
+            sessionID: target,
+            messageID: `msg-${target}`,
+            tokens: {
+              input: 714,
+              output: 60,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+          },
+        });
+      },
+      expectedTarget: { prefill: "Prefill: 340 ms │ 2.1k tok/s", decode: "Decode:  60 tok/s" },
+      expectedOther: { prefill: "Prefill: 340 ms", decode: "Decode:  ~41.7 tok/s" },
+    },
+    {
+      name: "v1 message.part.delta (non-text field ignored)",
+      isV1: true,
+      setup: (harness, target, other) => {
+        vi.setSystemTime(10_000);
+        for (const s of [target, other]) {
+          harness.emit("message.part.updated", {
+            part: {
+              type: "step-start",
+              sessionID: s,
+              messageID: `msg-${s}`,
+            },
+          });
+        }
+        vi.advanceTimersByTime(200);
+      },
+      emit: (harness, target) => {
+        harness.emit("message.part.delta", {
+          sessionID: target,
+          messageID: `msg-${target}`,
+          partID: `thought-${target}`,
+          field: "thought",
+          delta: "thinking ignored tokens",
+        });
+      },
+      expectedTarget: { prefill: "Prefill: …", decode: "Decode:  --" },
+      expectedOther: { prefill: "Prefill: …", decode: "Decode:  --" },
+      postCheck: (harness, target, other) => {
+        harness.emit("message.part.delta", {
+          sessionID: target,
+          messageID: `msg-${target}`,
+          partID: `text-${target}`,
+          field: "text",
+          delta: "forty characters are enough for a sample",
+        });
+        const targetLines = sidebarLines(harness.registration(), target);
+        const otherLines = sidebarLines(harness.registration(), other);
+        expect(targetLines[1]).toBe("Prefill: 200 ms");
+        expect(otherLines[1]).toBe("Prefill: …");
+      },
+    },
+  ];
+
+  const CROSS_PRODUCT_CASES = [
+    ...V2_ISOLATION_CASES.flatMap((c) =>
+      SESSIONS.map((target) => ({
+        ...c,
+        target,
+        other: otherSession(target),
+      })),
+    ),
+    ...V1_ISOLATION_CASES.flatMap((c) =>
+      SESSIONS.map((target) => ({
+        ...c,
+        target,
+        other: otherSession(target),
+      })),
+    ),
+  ];
+
+  it.each(CROSS_PRODUCT_CASES)(
+    "$name: targets $target while $other remains unchanged",
+    async ({
+      isV1,
+      setup,
+      emit,
+      postAdvanceMs,
+      expectedTarget,
+      expectedOther,
+      postCheck,
+      target,
+      other,
+    }) => {
+      vi.useFakeTimers();
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      if (isV1) {
+        vi.advanceTimersByTime(2_000);
+      }
+
+      if (setup) {
+        setup(harness, target, other);
+      }
+
+      emit(harness, target);
+
+      if (postAdvanceMs) {
+        vi.advanceTimersByTime(postAdvanceMs);
+      }
+
+      const linesTarget = sidebarLines(harness.registration(), target);
+      const linesOther = sidebarLines(harness.registration(), other);
+
+      expect(linesTarget[1]).toBe(expectedTarget.prefill);
+      expect(linesTarget[2]).toBe(expectedTarget.decode);
+
+      expect(linesOther[1]).toBe(expectedOther.prefill);
+      expect(linesOther[2]).toBe(expectedOther.decode);
+
+      if (postCheck) {
+        postCheck(harness, target, other);
+      }
+
+      await harness.dispose();
+    },
+  );
+
+  it("v2 session.error with absent sessionID transitions ALL in-flight sessions to error", async () => {
+    vi.useFakeTimers();
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B",
+      timestamp: 2_000,
+    });
+
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: …");
+
+    harness.emit("session.error", {
+      error: "Global process crash",
+    });
+
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B")).toEqual([
+      "Speed",
+      "Prefill: error",
+      "Decode:  error",
+    ]);
+
+    await harness.dispose();
+  });
+});
+
+describe("plugin.tui - generalized multi-session lifecycle and configuration", () => {
+  it("registers one default-order sidebar slot and all nine v2 events for all sessions", async () => {
     vi.useFakeTimers();
     const harness = createApiHarness();
 
@@ -446,7 +909,12 @@ describe("plugin.tui", () => {
     expect(harness.eventOn.mock.calls.map(([name]) => name)).toEqual(
       V2_EVENT_NAMES,
     );
-    expect(sidebarLines(harness.registration())).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: --",
+      "Decode:  --",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B")).toEqual([
       "Speed",
       "Prefill: --",
       "Decode:  --",
@@ -455,7 +923,7 @@ describe("plugin.tui", () => {
     await harness.dispose();
   });
 
-  it("activates and renders the v1 fallback with Date.now timestamps", async () => {
+  it("activates and renders the v1 fallback with Date.now timestamps across distinct sessions", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);
     const harness = createApiHarness();
@@ -469,43 +937,56 @@ describe("plugin.tui", () => {
       "message.part.delta",
     ]);
 
+    // sess-A starts
     harness.emit("message.part.updated", {
       part: {
         type: "step-start",
-        sessionID: "session-1",
-        messageID: "message-1",
+        sessionID: "sess-A",
+        messageID: "message-A",
       },
     });
-    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
       "Prefill: …",
+      "Decode:  --",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
+      "Prefill: --",
       "Decode:  --",
     ]);
 
     vi.advanceTimersByTime(340);
     harness.emit("message.part.delta", {
-      sessionID: "session-1",
-      messageID: "message-1",
-      partID: "text-1",
+      sessionID: "sess-A",
+      messageID: "message-A",
+      partID: "text-A",
       field: "text",
       delta: "forty characters are enough for a sample",
     });
-    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
       "Prefill: 340 ms",
       "Decode:  …",
     ]);
+    expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
+      "Prefill: --",
+      "Decode:  --",
+    ]);
 
     vi.advanceTimersByTime(250);
-    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
       "Prefill: 340 ms",
       "Decode:  ~190.5 tok/s",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
+      "Prefill: --",
+      "Decode:  --",
     ]);
 
     vi.advanceTimersByTime(750);
     harness.emit("message.part.updated", {
       part: {
         type: "step-finish",
-        sessionID: "session-1",
-        messageID: "message-1",
+        sessionID: "sess-A",
+        messageID: "message-A",
         tokens: {
           input: 714,
           output: 60,
@@ -514,7 +995,28 @@ describe("plugin.tui", () => {
         },
       },
     });
-    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
+      "Prefill: 340 ms │ 2.1k tok/s",
+      "Decode:  60 tok/s",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
+      "Prefill: --",
+      "Decode:  --",
+    ]);
+
+    // sess-B starts and completes independently
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-start",
+        sessionID: "sess-B",
+        messageID: "message-B",
+      },
+    });
+    expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
+      "Prefill: …",
+      "Decode:  --",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
       "Prefill: 340 ms │ 2.1k tok/s",
       "Decode:  60 tok/s",
     ]);
@@ -529,8 +1031,8 @@ describe("plugin.tui", () => {
 
     vi.advanceTimersByTime(1_999);
     harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "message-1",
+      sessionID: "sess-A",
+      assistantMessageID: "message-A",
       timestamp: 1_000,
     });
     vi.advanceTimersByTime(2_000);
@@ -538,6 +1040,8 @@ describe("plugin.tui", () => {
     expect(harness.eventOn).toHaveBeenCalledTimes(9);
     expect(harness.handlers.has("message.part.updated")).toBe(false);
     expect(harness.handlers.has("message.part.delta")).toBe(false);
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: --");
 
     await harness.dispose();
   });
@@ -547,10 +1051,12 @@ describe("plugin.tui", () => {
     const harness = createApiHarness(true);
     await plugin.tui(harness.api);
 
-    emitCompletedV2(harness);
+    emitCompletedV2(harness, "sess-A");
+    emitCompletedV2(harness, "sess-B");
 
     expect(harness.kvSet).not.toHaveBeenCalled();
-    sidebarLines(harness.registration(), "session-1");
+    sidebarLines(harness.registration(), "sess-A");
+    sidebarLines(harness.registration(), "sess-B");
     expect(harness.kvGet).not.toHaveBeenCalled();
     await harness.dispose();
   });
@@ -561,21 +1067,21 @@ describe("plugin.tui", () => {
     const harness = createApiHarness(true);
     await configured.tui(harness.api);
 
-    emitCompletedV2(harness, "session-1");
+    emitCompletedV2(harness, "sess-A");
     emitCompletedV2(
       harness,
-      "session-2",
+      "sess-B",
       { input: 200, output: 80, reasoning: 0, cache: { read: 50, write: 0 } },
       { t0: 2_000, t1: 2_400, t2: 3_200 },
     );
 
     expect(harness.kvSet.mock.calls).toEqual([
-      ["speed-measure:avg:session-1:ttft", 500],
-      ["speed-measure:avg:session-1:decode", 60],
-      ["speed-measure:avg:session-1:prefill", 200],
-      ["speed-measure:avg:session-2:ttft", 400],
-      ["speed-measure:avg:session-2:decode", 100],
-      ["speed-measure:avg:session-2:prefill", 500],
+      ["speed-measure:avg:sess-A:ttft", 500],
+      ["speed-measure:avg:sess-A:decode", 60],
+      ["speed-measure:avg:sess-A:prefill", 200],
+      ["speed-measure:avg:sess-B:ttft", 400],
+      ["speed-measure:avg:sess-B:decode", 100],
+      ["speed-measure:avg:sess-B:prefill", 500],
     ]);
     await harness.dispose();
   });
@@ -586,13 +1092,14 @@ describe("plugin.tui", () => {
     const harness = createApiHarness(false);
     await configured.tui(harness.api);
 
-    emitCompletedV2(harness, "session-1");
+    emitCompletedV2(harness, "sess-A");
+    emitCompletedV2(harness, "sess-B");
 
     expect(harness.kvSet).not.toHaveBeenCalled();
     await harness.dispose();
   });
 
-  it("clears both timers and every v1/v2 subscription on dispose", async () => {
+  it("clears both timers and every v1/v2 subscription on dispose with active sessions", async () => {
     vi.useFakeTimers();
     const beforeFallback = createApiHarness();
     await plugin.tui(beforeFallback.api);
@@ -611,6 +1118,7 @@ describe("plugin.tui", () => {
     await plugin.tui(afterFallback.api);
     vi.advanceTimersByTime(2_000);
     expect(afterFallback.unsubscribeSpies).toHaveLength(11);
+    harnessEmitBoth(afterFallback);
 
     await afterFallback.dispose();
 
@@ -627,12 +1135,14 @@ describe("plugin.tui", () => {
     ).toBe(true);
   });
 
-  it("calls Solid root dispose when onDispose is triggered", async () => {
+  it("calls Solid root dispose when onDispose is triggered with multiple active sessions", async () => {
     vi.useFakeTimers();
     rootDisposeSpy = undefined;
 
     const harness = createApiHarness();
     await plugin.tui(harness.api);
+
+    harnessEmitBoth(harness);
 
     expect(rootDisposeSpy).toBeDefined();
     expect(rootDisposeSpy).not.toHaveBeenCalled();
@@ -654,7 +1164,12 @@ describe("plugin.tui", () => {
     await expect(plugin.tui(harness.api)).resolves.not.toThrow();
 
     expect(harness.registration()?.order).toBe(150);
-    expect(sidebarLines(harness.registration())).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: --",
+      "Decode:  --",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B")).toEqual([
       "Speed",
       "Prefill: --",
       "Decode:  --",
@@ -663,7 +1178,7 @@ describe("plugin.tui", () => {
     await harness.dispose();
   });
 
-  it("applies custom configuration (order and liveIntervalMs)", async () => {
+  it("applies custom configuration (order and liveIntervalMs) maintaining session isolation", async () => {
     vi.useFakeTimers();
     const configured = await configuredPlugin({
       order: 250,
@@ -676,355 +1191,123 @@ describe("plugin.tui", () => {
 
     vi.setSystemTime(10_000);
     harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
       timestamp: 10_000,
     });
     harness.emit("session.next.text.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
       timestamp: 10_000,
     });
     harness.emit("session.next.text.delta", {
-      sessionID: "session-1",
+      sessionID: "sess-A",
       delta: "123456789012345678901234567890",
     });
 
     vi.advanceTimersByTime(250);
-    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  …");
+    expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe("Decode:  …");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: --");
 
     vi.advanceTimersByTime(50);
-    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  ~100 tok/s");
+    expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe("Decode:  ~100 tok/s");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: --");
 
     await harness.dispose();
   });
 
-  it("updates display to prefilling on session.next.step.started", async () => {
+  it("handles session.status: resets in-flight steps to idle and preserves done/error steps across multiple sessions", async () => {
     vi.useFakeTimers();
     const harness = createApiHarness();
     await plugin.tui(harness.api);
 
+    // 1. sess-A prefilling -> idle, while sess-B is decoding
     harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A1",
       timestamp: 1_000,
     });
-
-    expect(sidebarLines(harness.registration())).toEqual([
-      "Speed",
-      "Prefill: …",
-      "Decode:  --",
-    ]);
-
-    await harness.dispose();
-  });
-
-  it("transitions to decoding with reasoning timestamp on session.next.reasoning.started", async () => {
-    vi.useFakeTimers();
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
     harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_000,
-    });
-
-    harness.emit("session.next.reasoning.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      reasoningID: "reason-1",
-      timestamp: 1_250,
-    });
-
-    expect(sidebarLines(harness.registration())).toEqual([
-      "Speed",
-      "Prefill: 250 ms",
-      "Decode:  …",
-    ]);
-
-    await harness.dispose();
-  });
-
-  it("transitions to decoding on session.next.text.started", async () => {
-    vi.useFakeTimers();
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_000,
-    });
-
-    harness.emit("session.next.text.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      textID: "text-1",
-      timestamp: 1_400,
-    });
-
-    expect(sidebarLines(harness.registration())).toEqual([
-      "Speed",
-      "Prefill: 400 ms",
-      "Decode:  …",
-    ]);
-
-    await harness.dispose();
-  });
-
-  it("accumulates live chars and updates live estimate on session.next.reasoning.delta", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(10_000);
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 10_000,
-    });
-    harness.emit("session.next.reasoning.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 10_000,
-    });
-
-    harness.emit("session.next.reasoning.delta", {
-      sessionID: "session-1",
-      delta: "12345678901234567890", // 20 chars
-    });
-
-    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  …");
-
-    // Default liveIntervalMs is 150ms. At 150ms, elapsed = 0.15s: 20 chars / 0.15s = 133.3 tok/s
-    vi.advanceTimersByTime(150);
-    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  ~133.3 tok/s");
-
-    await harness.dispose();
-  });
-
-  it("accumulates live chars and updates live estimate on session.next.text.delta", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(10_000);
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 10_000,
-    });
-    harness.emit("session.next.text.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 10_000,
-    });
-
-    harness.emit("session.next.text.delta", {
-      sessionID: "session-1",
-      delta: "123456789012345678901234567890", // 30 chars
-    });
-
-    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  …");
-
-    // Default liveIntervalMs is 150ms. At 150ms, elapsed = 0.15s: 30 chars / 0.15s = 200 tok/s
-    vi.advanceTimersByTime(150);
-    expect(sidebarLines(harness.registration())[2]).toBe("Decode:  ~200 tok/s");
-
-    await harness.dispose();
-  });
-
-
-  it("finalizes measurements on session.next.step.ended", async () => {
-    vi.useFakeTimers();
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
       timestamp: 1_000,
     });
     harness.emit("session.next.text.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_500,
-    });
-    harness.emit("session.next.step.ended", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 2_500,
-      tokens: {
-        input: 100,
-        output: 60,
-        reasoning: 0,
-        cache: { read: 0, write: 0 },
-      },
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B1",
+      timestamp: 1_200,
     });
 
-    expect(sidebarLines(harness.registration())).toEqual([
-      "Speed",
-      "Prefill: 500 ms │ 200 tok/s",
-      "Decode:  60 tok/s",
-    ]);
-
-    await harness.dispose();
-  });
-
-  it("transitions to error on session.next.step.failed", async () => {
-    vi.useFakeTimers();
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_000,
-    });
-
-    harness.emit("session.next.step.failed", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      error: new Error("step execution failed"),
-    });
-
-    expect(sidebarLines(harness.registration())).toEqual([
-      "Speed",
-      "Prefill: error",
-      "Decode:  error",
-    ]);
-
-    await harness.dispose();
-  });
-
-  it("handles session.status: resets in-flight steps to idle and preserves done/error steps", async () => {
-    vi.useFakeTimers();
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
-    // 1. prefilling -> idle
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_000,
-    });
-    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: 200 ms");
 
     harness.emit("session.status", {
-      sessionID: "session-1",
+      sessionID: "sess-A",
       status: { type: "running" },
     });
-    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
 
     harness.emit("session.status", {
-      sessionID: "session-1",
+      sessionID: "sess-A",
       status: { type: "idle" },
     });
-    expect(sidebarLines(harness.registration())).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
       "Speed",
       "Prefill: --",
       "Decode:  --",
     ]);
+    // sess-B remains untouched
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: 200 ms");
 
-    // 2. decoding -> idle
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-2",
-      timestamp: 2_000,
-    });
-    harness.emit("session.next.text.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-2",
-      timestamp: 2_300,
-    });
-    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: 300 ms");
-
+    // 2. sess-B decoding -> idle
     harness.emit("session.status", {
-      sessionID: "session-1",
+      sessionID: "sess-B",
       status: { type: "idle" },
     });
-    expect(sidebarLines(harness.registration())).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-B")).toEqual([
       "Speed",
       "Prefill: --",
       "Decode:  --",
     ]);
 
     // 3. done -> stays done on idle
-    emitCompletedV2(harness, "session-1");
-    expect(sidebarLines(harness.registration())).toEqual([
+    emitCompletedV2(harness, "sess-A");
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
       "Speed",
       "Prefill: 500 ms │ 200 tok/s",
       "Decode:  60 tok/s",
     ]);
     harness.emit("session.status", {
-      sessionID: "session-1",
+      sessionID: "sess-A",
       status: { type: "idle" },
     });
-    expect(sidebarLines(harness.registration())).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
       "Speed",
       "Prefill: 500 ms │ 200 tok/s",
       "Decode:  60 tok/s",
     ]);
 
     // 4. error -> stays error on idle
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B2",
+      timestamp: 5_000,
+    });
     harness.emit("session.next.step.failed", {
-      sessionID: "session-1",
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B2",
       error: "failed",
     });
-    expect(sidebarLines(harness.registration())).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-B")).toEqual([
       "Speed",
       "Prefill: error",
       "Decode:  error",
     ]);
     harness.emit("session.status", {
-      sessionID: "session-1",
+      sessionID: "sess-B",
       status: { type: "idle" },
     });
-    expect(sidebarLines(harness.registration())).toEqual([
-      "Speed",
-      "Prefill: error",
-      "Decode:  error",
-    ]);
-
-    await harness.dispose();
-  });
-
-  it("transitions to error on session.error for targeted session and all in-flight when sessionID is absent", async () => {
-    vi.useFakeTimers();
-    const harness = createApiHarness();
-    await plugin.tui(harness.api);
-
-    // 1. targeted sessionID
-    harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
-      timestamp: 1_000,
-    });
-    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: …");
-
-    harness.emit("session.error", {
-      sessionID: "session-1",
-      error: "Network disconnect",
-    });
-    expect(sidebarLines(harness.registration(), "session-1")).toEqual([
-      "Speed",
-      "Prefill: error",
-      "Decode:  error",
-    ]);
-
-    // 2. sessionID is undefined/null -> affects in-flight sessions
-    harness.emit("session.next.step.started", {
-      sessionID: "session-2",
-      assistantMessageID: "msg-2",
-      timestamp: 2_000,
-    });
-    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: …");
-
-    harness.emit("session.error", {
-      error: "Global process crash",
-    });
-    expect(sidebarLines(harness.registration(), "session-2")).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-B")).toEqual([
       "Speed",
       "Prefill: error",
       "Decode:  error",
@@ -1041,22 +1324,22 @@ describe("plugin.tui", () => {
 
     emitCompletedV2(
       harness,
-      "session-1",
+      "sess-A",
       { input: 100, output: 60, reasoning: 0, cache: { read: 512, write: 0 } },
     );
     emitCompletedV2(
       harness,
-      "session-2",
+      "sess-B",
       { input: 100, output: 60, reasoning: 0, cache: { read: 1024, write: 0 } },
     );
 
-    const lines1 = sidebarLines(harness.registration(), "session-1");
+    const lines1 = sidebarLines(harness.registration(), "sess-A");
     expect(lines1[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 512");
 
-    const lines2 = sidebarLines(harness.registration(), "session-2");
+    const lines2 = sidebarLines(harness.registration(), "sess-B");
     expect(lines2[1]).toBe("Prefill: 500 ms │ 200 tok/s │ cache 1024");
 
-    const lines3 = sidebarLines(harness.registration(), "session-3");
+    const lines3 = sidebarLines(harness.registration(), "sess-C");
     expect(lines3[1]).toBe("Prefill: --");
 
     await harness.dispose();
@@ -1068,34 +1351,34 @@ describe("plugin.tui", () => {
     const harness = createApiHarness(true);
 
     harness.kvGet.mockImplementation((key: string) => {
-      if (key === "speed-measure:avg:session-1:ttft") return 250;
-      if (key === "speed-measure:avg:session-1:decode") return 75;
-      if (key === "speed-measure:avg:session-1:prefill") return 1_500;
-      if (key === "speed-measure:avg:session-2:ttft") return 400;
-      if (key === "speed-measure:avg:session-2:decode") return 120;
-      if (key === "speed-measure:avg:session-2:prefill") return 3_000;
+      if (key === "speed-measure:avg:sess-A:ttft") return 250;
+      if (key === "speed-measure:avg:sess-A:decode") return 75;
+      if (key === "speed-measure:avg:sess-A:prefill") return 1_500;
+      if (key === "speed-measure:avg:sess-B:ttft") return 400;
+      if (key === "speed-measure:avg:sess-B:decode") return 120;
+      if (key === "speed-measure:avg:sess-B:prefill") return 3_000;
       return undefined;
     });
 
     await configured.tui(harness.api);
 
-    emitCompletedV2(harness, "session-1");
-    emitCompletedV2(harness, "session-2");
+    emitCompletedV2(harness, "sess-A");
+    emitCompletedV2(harness, "sess-B");
 
-    const lines1 = sidebarLines(harness.registration(), "session-1");
+    const lines1 = sidebarLines(harness.registration(), "sess-A");
     expect(lines1[1]).toContain("(avg 250 ms)");
     expect(lines1[2]).toContain("(avg 75) tok/s");
 
-    const lines2 = sidebarLines(harness.registration(), "session-2");
+    const lines2 = sidebarLines(harness.registration(), "sess-B");
     expect(lines2[1]).toContain("(avg 400 ms)");
     expect(lines2[2]).toContain("(avg 120) tok/s");
 
-    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:ttft");
-    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:decode");
-    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-1:prefill");
-    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-2:ttft");
-    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-2:decode");
-    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:session-2:prefill");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-A:ttft");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-A:decode");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-A:prefill");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-B:ttft");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-B:decode");
+    expect(harness.kvGet).toHaveBeenCalledWith("speed-measure:avg:sess-B:prefill");
 
     await harness.dispose();
   });
@@ -1110,18 +1393,20 @@ describe("plugin.tui", () => {
     expect(harness.handlers.get("message.part.delta")?.size).toBe(1);
 
     harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "message-1",
+      sessionID: "sess-A",
+      assistantMessageID: "message-A",
       timestamp: 3_000,
     });
 
     expect(harness.handlers.get("message.part.updated")?.size).toBe(0);
     expect(harness.handlers.get("message.part.delta")?.size).toBe(0);
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: --");
 
     await harness.dispose();
   });
 
-  it("ignores non-text deltas in v1 fallback mode without incrementing live chars", async () => {
+  it("ignores non-text deltas in v1 fallback mode without incrementing live chars across sessions", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);
     const harness = createApiHarness();
@@ -1132,47 +1417,62 @@ describe("plugin.tui", () => {
     harness.emit("message.part.updated", {
       part: {
         type: "step-start",
-        sessionID: "session-1",
-        messageID: "message-1",
+        sessionID: "sess-A",
+        messageID: "message-A",
       },
     });
-    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-start",
+        sessionID: "sess-B",
+        messageID: "message-B",
+      },
+    });
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
+      "Prefill: …",
+      "Decode:  --",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
       "Prefill: …",
       "Decode:  --",
     ]);
 
     vi.advanceTimersByTime(200);
     harness.emit("message.part.delta", {
-      sessionID: "session-1",
-      messageID: "message-1",
-      partID: "thought-1",
+      sessionID: "sess-A",
+      messageID: "message-A",
+      partID: "thought-A",
       field: "thought",
       delta: "internal thinking output that should be ignored",
     });
 
-    // Should remain in prefilling phase
-    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+    // Both should remain in prefilling phase
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
+      "Prefill: …",
+      "Decode:  --",
+    ]);
+    expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
       "Prefill: …",
       "Decode:  --",
     ]);
 
-    // Advance timer: should still not estimate or transition
     vi.advanceTimersByTime(300);
-    expect(sidebarLines(harness.registration()).slice(1)).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
       "Prefill: …",
       "Decode:  --",
     ]);
 
-    // Now emit text delta
+    // Now emit text delta for sess-A only
     harness.emit("message.part.delta", {
-      sessionID: "session-1",
-      messageID: "message-1",
-      partID: "text-1",
+      sessionID: "sess-A",
+      messageID: "message-A",
+      partID: "text-A",
       field: "text",
       delta: "forty characters are enough for a sample",
     });
 
-    expect(sidebarLines(harness.registration())[1]).toBe("Prefill: 500 ms");
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: 500 ms");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: …");
 
     await harness.dispose();
   });
@@ -1183,11 +1483,18 @@ describe("plugin.tui", () => {
     const harness = createApiHarness(false);
     await configured.tui(harness.api);
 
-    emitCompletedV2(harness, "session-1");
+    emitCompletedV2(harness, "sess-A");
+    emitCompletedV2(harness, "sess-B");
 
-    const lines = sidebarLines(harness.registration(), "session-1");
+    const linesA = sidebarLines(harness.registration(), "sess-A");
+    const linesB = sidebarLines(harness.registration(), "sess-B");
     expect(harness.kvGet).not.toHaveBeenCalled();
-    expect(lines).toEqual([
+    expect(linesA).toEqual([
+      "Speed",
+      "Prefill: 500 ms (avg 500 ms)",
+      "Decode:  60 (avg 60) tok/s",
+    ]);
+    expect(linesB).toEqual([
       "Speed",
       "Prefill: 500 ms (avg 500 ms)",
       "Decode:  60 (avg 60) tok/s",
@@ -1196,7 +1503,7 @@ describe("plugin.tui", () => {
     await harness.dispose();
   });
 
-  it("renders header with theme.text and data rows with theme.textMuted", async () => {
+  it("renders header with theme.text and data rows with theme.textMuted across sessions", async () => {
     vi.useFakeTimers();
     const harness = createApiHarness();
     await plugin.tui(harness.api);
@@ -1205,15 +1512,16 @@ describe("plugin.tui", () => {
       text: "rgba(250, 250, 250, 1)",
       textMuted: "rgba(100, 100, 100, 1)",
     };
-    const rendered = sidebarRendered(
-      harness.registration(),
-      "session-1",
-      customTheme,
-    );
-
-    expect(rendered.children[0].props.fg).toBe("rgba(250, 250, 250, 1)");
-    expect(rendered.children[1].props.fg).toBe("rgba(100, 100, 100, 1)");
-    expect(rendered.children[2].props.fg).toBe("rgba(100, 100, 100, 1)");
+    for (const s of SESSIONS) {
+      const rendered = sidebarRendered(
+        harness.registration(),
+        s,
+        customTheme,
+      );
+      expect(rendered.children[0].props.fg).toBe("rgba(250, 250, 250, 1)");
+      expect(rendered.children[1].props.fg).toBe("rgba(100, 100, 100, 1)");
+      expect(rendered.children[2].props.fg).toBe("rgba(100, 100, 100, 1)");
+    }
 
     await harness.dispose();
   });
@@ -1224,65 +1532,72 @@ describe("plugin.tui", () => {
     const harness = createApiHarness();
     await plugin.tui(harness.api);
 
-    // session-1 starts
+    // sess-A starts
     harness.emit("session.next.step.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
       timestamp: 10_000,
     });
-    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: …");
-    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: --");
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: --");
 
-    // session-2 starts
+    // sess-B starts
     harness.emit("session.next.step.started", {
-      sessionID: "session-2",
-      assistantMessageID: "msg-2",
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B",
       timestamp: 10_100,
     });
-    // session-1 starts reasoning
+    // sess-A starts reasoning
     harness.emit("session.next.reasoning.started", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
       timestamp: 10_200,
     });
-    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: 200 ms");
-    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: …");
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: 200 ms");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: …");
 
-    // session-2 starts text directly
+    // sess-B starts text directly
     harness.emit("session.next.text.started", {
-      sessionID: "session-2",
-      assistantMessageID: "msg-2",
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B",
       timestamp: 10_400,
     });
-    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: 300 ms");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: 300 ms");
 
-    // session-1 finishes step
+    // sess-A finishes step
     harness.emit("session.next.step.ended", {
-      sessionID: "session-1",
-      assistantMessageID: "msg-1",
+      sessionID: "sess-A",
+      assistantMessageID: "msg-A",
       timestamp: 11_000,
       tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
     });
-    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: 200 ms │ 500 tok/s");
-    expect(sidebarLines(harness.registration(), "session-1")[2]).toBe("Decode:  62.5 tok/s");
-    expect(sidebarLines(harness.registration(), "session-2")[1]).toBe("Prefill: 300 ms");
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: 200 ms │ 500 tok/s");
+    expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe("Decode:  62.5 tok/s");
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: 300 ms");
 
-    // session-2 fails
+    // sess-B fails
     harness.emit("session.next.step.failed", {
-      sessionID: "session-2",
-      assistantMessageID: "msg-2",
-      error: "session-2 error",
+      sessionID: "sess-B",
+      assistantMessageID: "msg-B",
+      error: "sess-B error",
     });
-    expect(sidebarLines(harness.registration(), "session-2")).toEqual([
+    expect(sidebarLines(harness.registration(), "sess-B")).toEqual([
       "Speed",
       "Prefill: error",
       "Decode:  error",
     ]);
-    expect(sidebarLines(harness.registration(), "session-1")[1]).toBe("Prefill: 200 ms │ 500 tok/s");
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: 200 ms │ 500 tok/s");
 
     await harness.dispose();
   });
 });
 
-
-
+function harnessEmitBoth(harness: ReturnType<typeof createApiHarness>) {
+  for (const s of SESSIONS) {
+    harness.emit("session.next.step.started", {
+      sessionID: s,
+      assistantMessageID: `msg-${s}`,
+      timestamp: 1_000,
+    });
+  }
+}

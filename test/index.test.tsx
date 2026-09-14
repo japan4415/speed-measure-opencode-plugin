@@ -2395,6 +2395,382 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
 
     await harness.dispose();
   });
+
+  it("v1 fallback ignores non-step message.part.updated events (text, tool, etc.) preserving idle, prefilling, decoding, and done states", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const harness = createApiHarness();
+    await plugin.tui(harness.api);
+
+    // Advance 2s to activate v1 fallback
+    vi.advanceTimersByTime(2_000);
+
+    // 1. Idle state: non-step part.updated should NOT transition to prefilling
+    for (const nonStepType of ["text", "tool", "reasoning", "custom"]) {
+      harness.emit("message.part.updated", {
+        part: {
+          type: nonStepType,
+          sessionID: "sess-A",
+          messageID: "msg-A",
+        },
+      });
+      expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+        "Speed",
+        "Prefill: --",
+        "Decode:  --",
+      ]);
+    }
+
+    // 2. Start prefilling at t0 = 12_000
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-start",
+        sessionID: "sess-A",
+        messageID: "msg-A",
+      },
+    });
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+
+    // Advance 200ms to 12_200. Emitting non-step updates must NOT reset t0!
+    vi.advanceTimersByTime(200);
+    for (const nonStepType of ["text", "tool", "thought"]) {
+      harness.emit("message.part.updated", {
+        part: {
+          type: nonStepType,
+          sessionID: "sess-A",
+          messageID: "msg-A",
+        },
+      });
+      // Remains in prefilling
+      expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+    }
+
+    // Advance 300ms to 12_500. Now emit first text delta.
+    // If t0 was reset to 12_200, TTFT would be 300 ms.
+    // Since t0 must stay at 12_000, TTFT must be exactly 500 ms (12_500 - 12_000).
+    vi.advanceTimersByTime(300);
+    harness.emit("message.part.delta", {
+      sessionID: "sess-A",
+      messageID: "msg-A",
+      field: "text",
+      delta: "forty characters sample for testing TTFT",
+    });
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: 500 ms");
+
+    // 3. Decoding state: non-step updates must NOT reset back to prefilling
+    for (const nonStepType of ["text", "tool", "action"]) {
+      harness.emit("message.part.updated", {
+        part: {
+          type: nonStepType,
+          sessionID: "sess-A",
+          messageID: "msg-A",
+        },
+      });
+      expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: 500 ms");
+    }
+
+    // 4. Complete step at 13_500
+    vi.advanceTimersByTime(1_000);
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-finish",
+        sessionID: "sess-A",
+        messageID: "msg-A",
+        tokens: {
+          input: 100,
+          output: 50,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+      },
+    });
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 500 ms │ 200 tok/s",
+      "Decode:  50 tok/s",
+    ]);
+
+    // 5. Done state: non-step updates must NOT reset done back to prefilling
+    for (const nonStepType of ["text", "tool", "status"]) {
+      harness.emit("message.part.updated", {
+        part: {
+          type: nonStepType,
+          sessionID: "sess-A",
+          messageID: "msg-A",
+        },
+      });
+      expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+        "Speed",
+        "Prefill: 500 ms │ 200 tok/s",
+        "Decode:  50 tok/s",
+      ]);
+    }
+
+    await harness.dispose();
+  });
+
+  it("v2: resets stepHistory across different assistantMessageIDs (turns) within the same session while preserving history in multi-step turns", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({ showAverages: true });
+    const harness = createApiHarness(true);
+    await configured.tui(harness.api);
+
+    // --- Turn 1: msg-turn-1, Step 1 ---
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-1",
+      timestamp: 10_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-1",
+      timestamp: 10_500,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-1",
+      timestamp: 11_500,
+      tokens: { input: 100, output: 60, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 500 ms (avg 500 ms)",
+      "Decode:  60 (avg 60) tok/s",
+    ]);
+
+    // --- Turn 1: msg-turn-1, Step 2 (Same assistantMessageID -> history preserved) ---
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-1",
+      timestamp: 12_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-1",
+      timestamp: 12_300,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-1",
+      timestamp: 13_300,
+      tokens: { input: 100, output: 40, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    // Avg TTFT = (500 + 300) / 2 = 400 ms
+    // Avg Decode = (60 + 40) / 2 = 50 tok/s
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 300 ms (avg 400 ms)",
+      "Decode:  40 (avg 50) tok/s",
+    ]);
+
+    // --- Turn 2: msg-turn-2, Step 1 (Different assistantMessageID -> history MUST reset) ---
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-2",
+      timestamp: 20_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-2",
+      timestamp: 20_800,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-turn-2",
+      timestamp: 21_800,
+      tokens: { input: 100, output: 80, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    // Turn 1 history is cleared! Only Turn 2 Step 1 is in history:
+    // Avg TTFT = 800 ms (NOT (500 + 300 + 800)/3 = 533 ms)
+    // Avg Decode = 80 tok/s (NOT (60 + 40 + 80)/3 = 60 tok/s)
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 800 ms (avg 800 ms)",
+      "Decode:  80 (avg 80) tok/s",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("v1 fallback: resets stepHistory across different messageIDs (turns) within the same session while preserving history in multi-step turns", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const configured = await configuredPlugin({ showAverages: true });
+    const harness = createApiHarness(true);
+    await configured.tui(harness.api);
+
+    // Activate v1 fallback
+    vi.advanceTimersByTime(2_000);
+
+    // --- Turn 1: msg-v1-turn-1, Step 1 ---
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-start",
+        sessionID: "sess-A",
+        messageID: "msg-v1-turn-1",
+      },
+    });
+    vi.advanceTimersByTime(500); // 12_500
+    harness.emit("message.part.delta", {
+      sessionID: "sess-A",
+      messageID: "msg-v1-turn-1",
+      field: "text",
+      delta: "sample chunk",
+    });
+    vi.advanceTimersByTime(1_000); // 13_500
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-finish",
+        sessionID: "sess-A",
+        messageID: "msg-v1-turn-1",
+        tokens: { input: 100, output: 60, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 500 ms (avg 500 ms)",
+      "Decode:  60 (avg 60) tok/s",
+    ]);
+
+    // --- Turn 1: msg-v1-turn-1, Step 2 (Same messageID -> history preserved) ---
+    vi.advanceTimersByTime(500); // 14_000
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-start",
+        sessionID: "sess-A",
+        messageID: "msg-v1-turn-1",
+      },
+    });
+    vi.advanceTimersByTime(300); // 14_300
+    harness.emit("message.part.delta", {
+      sessionID: "sess-A",
+      messageID: "msg-v1-turn-1",
+      field: "text",
+      delta: "sample chunk 2",
+    });
+    vi.advanceTimersByTime(1_000); // 15_300
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-finish",
+        sessionID: "sess-A",
+        messageID: "msg-v1-turn-1",
+        tokens: { input: 100, output: 40, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+    // Avg TTFT = (500 + 300) / 2 = 400 ms
+    // Avg Decode = (60 + 40) / 2 = 50 tok/s
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 300 ms (avg 400 ms)",
+      "Decode:  40 (avg 50) tok/s",
+    ]);
+
+    // --- Turn 2: msg-v1-turn-2, Step 1 (Different messageID -> history MUST reset) ---
+    vi.advanceTimersByTime(5_000); // 20_300
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-start",
+        sessionID: "sess-A",
+        messageID: "msg-v1-turn-2",
+      },
+    });
+    vi.advanceTimersByTime(800); // 21_100
+    harness.emit("message.part.delta", {
+      sessionID: "sess-A",
+      messageID: "msg-v1-turn-2",
+      field: "text",
+      delta: "turn 2 sample",
+    });
+    vi.advanceTimersByTime(1_000); // 22_100
+    harness.emit("message.part.updated", {
+      part: {
+        type: "step-finish",
+        sessionID: "sess-A",
+        messageID: "msg-v1-turn-2",
+        tokens: { input: 100, output: 80, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+    // Turn 1 history is cleared!
+    // Avg TTFT = 800 ms (NOT 533 ms)
+    // Avg Decode = 80 tok/s (NOT 60 tok/s)
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: 800 ms (avg 800 ms)",
+      "Decode:  80 (avg 80) tok/s",
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("distinguishes payload fields across multiple values and handles branch matches and non-matches", async () => {
+    vi.useFakeTimers();
+    const configured = await configuredPlugin({ showCache: true, showAverages: false });
+    const harness = createApiHarness(true);
+    await configured.tui(harness.api);
+
+    // 1. Verify tokens.cache.read variation: cache read = 77
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-tokens-1",
+      timestamp: 1_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-tokens-1",
+      timestamp: 1_200,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-tokens-1",
+      timestamp: 2_200,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 77, write: 0 } },
+    });
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toContain("cache 77");
+
+    // 2. Verify tokens.cache.read variation: cache read = 99 on sess-B
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-tokens-2",
+      timestamp: 3_000,
+    });
+    harness.emit("session.next.text.started", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-tokens-2",
+      timestamp: 3_400,
+    });
+    harness.emit("session.next.step.ended", {
+      sessionID: "sess-B",
+      assistantMessageID: "msg-tokens-2",
+      timestamp: 4_400,
+      tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 99, write: 0 } },
+    });
+    expect(sidebarLines(harness.registration(), "sess-B")[1]).toContain("cache 99");
+
+    // 3. session.status: match ("idle") vs non-match ("busy", "paused")
+    // Start step on sess-A
+    harness.emit("session.next.step.started", {
+      sessionID: "sess-A",
+      assistantMessageID: "msg-tokens-3",
+      timestamp: 5_000,
+    });
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+
+    // Non-matching statuses: "busy", "paused" -> does NOT reset to idle
+    harness.emit("session.status", { sessionID: "sess-A", status: { type: "busy" } });
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+    harness.emit("session.status", { sessionID: "sess-A", status: { type: "paused" } });
+    expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
+
+    // Matching status: "idle" -> resets in-flight step to idle
+    harness.emit("session.status", { sessionID: "sess-A", status: { type: "idle" } });
+    expect(sidebarLines(harness.registration(), "sess-A")).toEqual([
+      "Speed",
+      "Prefill: --",
+      "Decode:  --",
+    ]);
+
+    await harness.dispose();
+  });
 });
 
 function harnessEmitBoth(harness: ReturnType<typeof createApiHarness>) {

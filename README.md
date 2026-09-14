@@ -82,6 +82,8 @@ npm run build
 
 ## 開発
 
+開発には Node.js `^20.19.0 || >=22.12.0` が必要（Vite 7 の要件）。公開済みの `dist/index.js` は OpenCode の Bun ランタイムで読み込まれるため、この開発要件は npm パッケージの `engines.node` には設定しない。
+
 ```bash
 npm test        # vitest によるユニットテスト
 npm run typecheck  # tsc --noEmit

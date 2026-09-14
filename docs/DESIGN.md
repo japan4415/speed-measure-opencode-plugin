@@ -43,7 +43,7 @@ builtin の `internal:sidebar-context`（order=100）の直後、order=150 に�
 |------|-----------|----------|
 | idle（初期） | `Prefill: --` | `Decode:  --` |
 | prefilling | `Prefill: …` | `Decode:  --` |
-| decoding (ライブ) | `Prefill: 340 ms` | `Decode:  ~45.2 tok/s` |
+| decoding (ライブ) | `Prefill: 340 ms` | `Decode:  ~45.2 chars/s` |
 | done (確定) | `Prefill: 340 ms │ 2.1k tok/s` | `Decode:  58.3 tok/s` |
 | done + avg 表示 | `Prefill: 340 ms (avg 280 ms)` | `Decode:  58.3 (avg 52) tok/s` |
 | error/abort | `Prefill: error` | `Decode:  error` |
@@ -287,7 +287,10 @@ tick(state: CollectorState): CollectorState {
 }
 ```
 
-文字数÷経過秒は粗い近似（日本語テキストではトークン数より文字数が多い傾向がある）。確定値は `step_ended` のトークン数から計算するため、ライブ表示の誤差は許容する。
+`liveEstimate` は文字数÷経過秒であり、表示単位は `chars/s` とする。確定値は
+`step_ended` のトークン数から計算して `tok/s` と表示する。文字数とトークン数の比は
+入力内容やモデルに依存するため、固定係数では換算せず、ライブ値と確定値を異なる単位で
+明示して同一尺度であるという誤認を防ぐ。
 
 ### 3.4 decodeTokPerSec 計算
 
@@ -405,7 +408,9 @@ export default {
                 case "prefilling": return "Decode:  --";
                 case "decoding": {
                   const est = s.liveEstimate;
-                  return est != null ? `Decode:  ~${formatSpeed(est)}` : "Decode:  …";
+                  return est != null
+                    ? `Decode:  ~${stripSpeedUnit(formatSpeed(est))} chars/s`
+                    : "Decode:  …";
                 }
                 case "done":  return `Decode:  ${formatSpeed(s.decodeTokPerSec)}`;
                 default:      return "Decode:  error";
@@ -608,7 +613,7 @@ vLLM サーバーは `http://172-25-4-137.tailcd0071.ts.net:8888/v1` で稼働�
 1. `npm run build` → `dist/index.js` 生成を確認
 2. `tui.jsonc` にパスを追加して OpenCode を再起動
 3. チャットを送信して以下を確認:
-   - ストリーミング中に `Decode: ~XX tok/s` がライブ更新される
+   - ストリーミング中に文字ベースの `Decode: ~XX chars/s` がライブ更新される
    - 完了後に確定値（整数 TTFT と tok/s）に切り替わる
    - `TTFT` が概ね 100ms〜数秒（vLLM の典型範囲）であること
    - ツールコールを含むプロンプトで各ステップが独立して計測されること

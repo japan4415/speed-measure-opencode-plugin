@@ -292,8 +292,46 @@ describe("buildDisplayLines", () => {
 
     expect(buildDisplayLines(state, "sess-A")).toEqual({
       prefill: "Prefill: 340 ms",
-      decode: "Decode:  ~45.2 tok/s",
+      decode: "Decode:  ~45.2 chars/s",
     });
+  });
+
+  it("distinguishes live character throughput from final token throughput", () => {
+    const live: CollectorState = new Map([
+      [
+        "sess-A",
+        {
+          current: {
+            phase: "decoding",
+            sessionID: "sess-A",
+            assistantMessageID: "message-1",
+            t0: 1_000,
+            t1: 1_340,
+            ttft: 340,
+            liveChars: 120,
+            liveEstimate: 120,
+          },
+          stepHistory: [],
+        },
+      ],
+    ]);
+    const done = {
+      phase: "done" as const,
+      sessionID: "sess-A",
+      ttft: 340,
+      prefillTokPerSec: 2_100,
+      decodeTokPerSec: 30,
+    };
+    const complete: CollectorState = new Map([
+      ["sess-A", { current: done, stepHistory: [done] }],
+    ]);
+
+    expect(buildDisplayLines(live, "sess-A").decode).toBe(
+      "Decode:  ~120 chars/s",
+    );
+    expect(buildDisplayLines(complete, "sess-A").decode).toBe(
+      "Decode:  30 tok/s",
+    );
   });
 
   it("shows final values for a completed step", () => {
@@ -513,14 +551,14 @@ describe("buildDisplayLines - config combinations × state cross-product matrix"
         ],
       ]),
       expectedByConfig: {
-        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
-        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
-        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
-        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  ~45.2 tok/s" },
-        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
-        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
-        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
-        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 tok/s" },
+        "TTFT:false_Avg:false_Cache:false": { prefill: "Prefill: --", decode: "Decode:  ~45.2 chars/s" },
+        "TTFT:false_Avg:false_Cache:true": { prefill: "Prefill: --", decode: "Decode:  ~45.2 chars/s" },
+        "TTFT:false_Avg:true_Cache:false": { prefill: "Prefill: --", decode: "Decode:  ~45.2 chars/s" },
+        "TTFT:false_Avg:true_Cache:true": { prefill: "Prefill: --", decode: "Decode:  ~45.2 chars/s" },
+        "TTFT:true_Avg:false_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 chars/s" },
+        "TTFT:true_Avg:false_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 chars/s" },
+        "TTFT:true_Avg:true_Cache:false": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 chars/s" },
+        "TTFT:true_Avg:true_Cache:true": { prefill: "Prefill: 340 ms", decode: "Decode:  ~45.2 chars/s" },
       },
     },
     {
@@ -1661,8 +1699,8 @@ describe("plugin.tui - event isolation cross-product matrix", () => {
         });
       },
       postAdvanceMs: 150,
-      expectedTarget: { prefill: "Prefill: 0 ms", decode: "Decode:  ~133.3 tok/s" },
-      expectedOther: { prefill: "Prefill: 0 ms", decode: "Decode:  ~0 tok/s" },
+      expectedTarget: { prefill: "Prefill: 0 ms", decode: "Decode:  ~133.3 chars/s" },
+      expectedOther: { prefill: "Prefill: 0 ms", decode: "Decode:  ~0 chars/s" },
     },
     {
       name: "v2 session.next.text.started",
@@ -1711,8 +1749,8 @@ describe("plugin.tui - event isolation cross-product matrix", () => {
         });
       },
       postAdvanceMs: 150,
-      expectedTarget: { prefill: "Prefill: 0 ms", decode: "Decode:  ~200 tok/s" },
-      expectedOther: { prefill: "Prefill: 0 ms", decode: "Decode:  ~0 tok/s" },
+      expectedTarget: { prefill: "Prefill: 0 ms", decode: "Decode:  ~200 chars/s" },
+      expectedOther: { prefill: "Prefill: 0 ms", decode: "Decode:  ~0 chars/s" },
     },
     {
       name: "v2 session.next.step.ended",
@@ -1891,7 +1929,7 @@ describe("plugin.tui - event isolation cross-product matrix", () => {
         });
       },
       expectedTarget: { prefill: "Prefill: 340 ms │ 2.1k tok/s", decode: "Decode:  60 tok/s" },
-      expectedOther: { prefill: "Prefill: 340 ms", decode: "Decode:  ~41.7 tok/s" },
+      expectedOther: { prefill: "Prefill: 340 ms", decode: "Decode:  ~41.7 chars/s" },
     },
     {
       name: "v1 message.part.delta (non-text field ignored)",
@@ -2117,7 +2155,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     vi.advanceTimersByTime(250);
     expect(sidebarLines(harness.registration(), "sess-A").slice(1)).toEqual([
       "Prefill: 340 ms",
-      "Decode:  ~190.5 tok/s",
+      "Decode:  ~190.5 chars/s",
     ]);
     expect(sidebarLines(harness.registration(), "sess-B").slice(1)).toEqual([
       "Prefill: --",
@@ -2361,7 +2399,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: --");
 
     vi.advanceTimersByTime(50);
-    expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe("Decode:  ~100 tok/s");
+    expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe("Decode:  ~100 chars/s");
     expect(sidebarLines(harness.registration(), "sess-B")[1]).toBe("Prefill: --");
 
     await harness.dispose();
@@ -4513,4 +4551,3 @@ describe("default cache value when tokens.cache is omitted (BB4)", () => {
     }
   });
 });
-

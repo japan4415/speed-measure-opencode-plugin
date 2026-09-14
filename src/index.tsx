@@ -206,7 +206,7 @@ export function buildDisplayLines(
         decode:
           current.liveEstimate === null
             ? "Decode:  …"
-            : `Decode:  ~${formatSpeed(current.liveEstimate)}`,
+            : `Decode:  ~${stripSpeedUnit(formatSpeed(current.liveEstimate))} chars/s`,
       };
     case "done": {
       const decodeCurrent = stripSpeedUnit(formatSpeed(current.decodeTokPerSec));

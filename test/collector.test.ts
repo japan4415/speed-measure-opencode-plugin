@@ -1114,6 +1114,43 @@ describe("SpeedCollector", () => {
     ).toEqual(nonDecodingBefore);
   });
 
+  it("tick continues past a completed session that is first in Map order", () => {
+    const collector = new SpeedCollector();
+    let state = collector.onStepStarted(
+      new Map(),
+      ev.stepStarted("completed-first", -200)
+    );
+    state = collector.onTextStarted(
+      state,
+      ev.textStarted(0, "completed-first")
+    );
+    state = collector.onStepEnded(
+      state,
+      ev.stepEnded(1000, 10, 0, 100, "completed-first")
+    );
+    state = collector.onStepStarted(
+      state,
+      ev.stepStarted("decoding-second", 0)
+    );
+    state = collector.onTextStarted(
+      state,
+      ev.textStarted(100, "decoding-second")
+    );
+    state = collector.onTextDelta(
+      state,
+      ev.textDelta("1234567890", "decoding-second")
+    );
+
+    expect([...state.keys()]).toEqual(["completed-first", "decoding-second"]);
+    const ticked = collector.tick(state, 1100);
+
+    expect(ticked.get("completed-first")?.current.phase).toBe("done");
+    expect(ticked.get("decoding-second")?.current).toMatchObject({
+      phase: "decoding",
+      liveEstimate: 10,
+    });
+  });
+
   it("onIdle selects the requested session even when another session is first", () => {
     const collector = new SpeedCollector();
     const other = stateAtPhase("prefilling", "map-first").get("map-first");
@@ -1342,6 +1379,7 @@ describe("SpeedCollector", () => {
       const current = state.get("s1")?.current;
       expect(current?.phase).toBe("done");
       if (current?.phase !== "done") return;
+      expect(current.ttft).toBe(ttft);
       if (expected === null) {
         expect(current.prefillTokPerSec).toBe(expected);
       } else {
@@ -1354,6 +1392,32 @@ describe("SpeedCollector", () => {
       }
     }
   );
+
+  it.each([
+    [
+      "reasoning.started",
+      (collector: SpeedCollector, state: CollectorState) =>
+        collector.onReasoningStarted(state, ev.reasoningStarted(1100)),
+    ],
+    [
+      "text.started",
+      (collector: SpeedCollector, state: CollectorState) =>
+        collector.onTextStarted(state, ev.textStarted(1100)),
+    ],
+  ] as const)("preserves a negative TTFT through %s", (_source, startDecoding) => {
+    const collector = new SpeedCollector();
+    let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1200));
+    state = startDecoding(collector, state);
+    state = collector.onStepEnded(state, ev.stepEnded(2000, 9, 0, 100));
+
+    expect(state.get("s1")?.current).toMatchObject({
+      phase: "done",
+      sessionID: "s1",
+      ttft: -100,
+      prefillTokPerSec: null,
+      decodeTokPerSec: 10,
+    });
+  });
 
   it.each([
     ["tokens", 0, null],

@@ -772,8 +772,16 @@ vLLM サーバーは `http://172-25-4-137.tailcd0071.ts.net:8888/v1` で稼働�
 - **v2 有効時に TTFT がほぼ 0 になる**
   - OpenCode の publisher は `case "step-start": return` で何もせず、`SessionEvent.Step.Started` は `startAssistant()` 経由で text-start / reasoning-start / tool-input-start の最初のコンテンツ片で初めて publish される。
   - このため v2 では `t0`（`session.next.step.started`）と `t1`（first token）がほぼ同時刻になり TTFT ≈ 0 になる。
-  - v1 経路では `step-start` part が真の開始（実測で first token の 508 ms 前）なので TTFT は正常に計測できる。
+  - v1 経路では `step-start` part が真の開始なので TTFT は正常に計測できる。実 DB（`~/.local/share/opencode/opencode.db`）で全 step の step-start part の `time_created` と、その step 内で最初に現れる text/reasoning part の `time.start` の差を集計すると `n=1416, min=0, p25=2, p50=7, mean=260, p75=502, max=1476`（ms）であり、中央値 7 ms で `step-start` は first token より前に来る（負値なし）。
   - §1.1 の前提（`t0` = step 開始）と矛盾する。**別 Issue として扱う（今回は未修正）。**
+- **v1 fallback では decode 窓の両端とツール区間で時刻ソースが混在する**
+  - `src/index.tsx:319` の `const now = Date.now()` がクライアント時刻であり、`step-start`（:322-328）と `step-finish`（:332-337）へ渡される。`t1`（first token）も `message.part.delta` 受信時の `Date.now()` である。
+  - 一方ツール区間は `src/index.tsx:350-366` で tool part の `state.time.start` / `state.time.end` を無変換で `onToolCalled` / `onToolEnded` へ渡す。これは §3.2 のとおりクライアントの `Date.now()` ではなく SDK が記録したサーバー時刻である。
+  - `toolBusyMs()`（`src/collector.ts:172-177`）は区間を `[t1, stepEnded]` へ clamp するため、2つの時刻ソースがずれているとツール区間が窓の外と判定されて丸ごと捨てられ、減算が行われない。
+  - 再現例: クライアント `t1 = 12,500`、`step-finish = 73,150`、サーバー時計が1時間進んでおり実際のツール実行 `13,000..73,000` が `state.time = 3,613,000..3,673,000` として記録される。`output = 50` のとき `toolBusyMs` は区間を窓外として捨て、期待 76.9 tok/s に対し実際 0.824 tok/s になる。
+  - 顕在化するのは opencode server がクライアントと別マシンで動作し、かつ両者の時計がずれている場合に限られる。同一マシンの通常のローカル利用では両者が同じ `Date.now()` の時計を参照するため差は配送遅延（ミリ秒オーダー）だけで、実害は生じない。
+  - **v2 経路はこの問題の影響を受けない。** v2 は窓の両端もツール区間もすべて `session.next.*` イベントの `timestamp`（同一ソース）を使う。
+  - 将来解消する場合の選択肢: (a) v1 の窓の両端も part のサーバー時刻から取る（TTFT / prefill の計測にも波及するため要注意）、(b) ツール区間もクライアント時刻に揃える（配送遅延の分だけ精度が落ちる）。どちらを採るかは未決定。
 - **v2 では continuation ごとに `assistantMessageID` が変わりうる**
   - collector は `assistantMessageID` の変化で `stepHistory` をリセットする（`src/collector.ts` の `onStepStarted` 内、215 行目付近）。
   - このため平均値表示（`showAverages: true`）が step をまたげない可能性がある。未検証。

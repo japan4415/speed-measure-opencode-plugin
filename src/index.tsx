@@ -336,6 +336,37 @@ const plugin = {
                 timestamp: now,
                 tokens: part.tokens,
               });
+              return;
+            }
+
+            if (part.type === "tool") {
+              // Runtime payloads may omit `state` entirely, so read it defensively.
+              const toolState = part.state as
+                | { time?: { start?: number; end?: number } }
+                | undefined;
+              const toolTime = toolState?.time;
+              const sessionID = part.sessionID;
+              const callID = part.callID;
+              if (toolTime && typeof toolTime.start === "number") {
+                const timestamp = toolTime.start;
+                update((previous) =>
+                  collector.onToolCalled(previous, {
+                    sessionID,
+                    callID,
+                    timestamp,
+                  }),
+                );
+              }
+              if (toolTime && typeof toolTime.end === "number") {
+                const timestamp = toolTime.end;
+                update((previous) =>
+                  collector.onToolEnded(previous, {
+                    sessionID,
+                    callID,
+                    timestamp,
+                  }),
+                );
+              }
             }
           }),
           api.event.on("message.part.delta", (event) => {
@@ -390,6 +421,21 @@ const plugin = {
         api.event.on("session.next.text.delta", (event) =>
           update((previous) =>
             collector.onTextDelta(previous, event.properties),
+          ),
+        ),
+        api.event.on("session.next.tool.called", (event) =>
+          update((previous) =>
+            collector.onToolCalled(previous, event.properties),
+          ),
+        ),
+        api.event.on("session.next.tool.success", (event) =>
+          update((previous) =>
+            collector.onToolEnded(previous, event.properties),
+          ),
+        ),
+        api.event.on("session.next.tool.failed", (event) =>
+          update((previous) =>
+            collector.onToolEnded(previous, event.properties),
           ),
         ),
         api.event.on("session.next.step.ended", (event) =>

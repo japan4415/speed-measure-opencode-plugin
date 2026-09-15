@@ -11,6 +11,7 @@ import {
 import reasoningFixture from "./fixtures/reasoning.json";
 import simpleTextFixture from "./fixtures/simple-text.json";
 import toolCallFixture from "./fixtures/tool-call.json";
+import toolExecutionFixture from "./fixtures/tool-execution.json";
 
 type EventProperties<T extends Event["type"]> = Extract<
   Event,
@@ -96,6 +97,44 @@ const ev = {
     timestamp: 1500,
     error: { type: "unknown", message: "failed" },
   }),
+  toolCalled: (
+    callID: string,
+    timestamp: number,
+    sessionID = "s1"
+  ): EventProperties<"session.next.tool.called"> => ({
+    sessionID,
+    assistantMessageID: "msg1",
+    timestamp,
+    callID,
+    tool: "bash",
+    input: { command: "sleep 60" },
+    provider: { executed: false },
+  }),
+  toolSucceeded: (
+    callID: string,
+    timestamp: number,
+    sessionID = "s1"
+  ): EventProperties<"session.next.tool.success"> => ({
+    sessionID,
+    assistantMessageID: "msg1",
+    timestamp,
+    callID,
+    structured: {},
+    content: [],
+    provider: { executed: false },
+  }),
+  toolFailed: (
+    callID: string,
+    timestamp: number,
+    sessionID = "s1"
+  ): EventProperties<"session.next.tool.failed"> => ({
+    sessionID,
+    assistantMessageID: "msg1",
+    timestamp,
+    callID,
+    error: { type: "unknown", message: "tool failed" },
+    provider: { executed: false },
+  }),
 };
 
 const fixtureEventTypes = [
@@ -104,6 +143,9 @@ const fixtureEventTypes = [
   "session.next.reasoning.delta",
   "session.next.text.started",
   "session.next.text.delta",
+  "session.next.tool.called",
+  "session.next.tool.success",
+  "session.next.tool.failed",
   "session.next.step.ended",
 ] as const;
 
@@ -169,6 +211,19 @@ function assertStringArray(
     throw new Error(`${path} must be an array`);
   }
   value.forEach((item, index) => assertString(item, `${path}[${index}]`));
+}
+
+function assertToolProvider(value: unknown, path: string): void {
+  if (!isRecord(value)) {
+    throw new Error(`${path} must be an object`);
+  }
+  assertExactKeys(value, ["executed", "metadata"], path);
+  if (typeof value.executed !== "boolean") {
+    throw new Error(`${path}.executed must be a boolean`);
+  }
+  if ("metadata" in value && !isRecord(value.metadata)) {
+    throw new Error(`${path}.metadata must be an object`);
+  }
 }
 
 function assertFixtureEvent(
@@ -348,6 +403,90 @@ function assertFixtureEvent(
       assertString(properties.textID, `${eventPath}.properties.textID`);
       assertString(properties.delta, `${eventPath}.properties.delta`);
       break;
+    case "session.next.tool.called": {
+      assertExactKeys(
+        properties,
+        [
+          "timestamp",
+          "sessionID",
+          "assistantMessageID",
+          "callID",
+          "tool",
+          "input",
+          "provider",
+        ],
+        `${eventPath}.properties`
+      );
+      assertString(properties.callID, `${eventPath}.properties.callID`);
+      assertString(properties.tool, `${eventPath}.properties.tool`);
+      if (!isRecord(properties.input)) {
+        throw new Error(`${eventPath}.properties.input must be an object`);
+      }
+      assertToolProvider(
+        properties.provider,
+        `${eventPath}.properties.provider`
+      );
+      break;
+    }
+    case "session.next.tool.success": {
+      assertExactKeys(
+        properties,
+        [
+          "timestamp",
+          "sessionID",
+          "assistantMessageID",
+          "callID",
+          "structured",
+          "content",
+          "outputPaths",
+          "result",
+          "provider",
+        ],
+        `${eventPath}.properties`
+      );
+      assertString(properties.callID, `${eventPath}.properties.callID`);
+      if (!isRecord(properties.structured)) {
+        throw new Error(`${eventPath}.properties.structured must be an object`);
+      }
+      if (!Array.isArray(properties.content)) {
+        throw new Error(`${eventPath}.properties.content must be an array`);
+      }
+      if ("outputPaths" in properties) {
+        assertStringArray(
+          properties.outputPaths,
+          `${eventPath}.properties.outputPaths`
+        );
+      }
+      assertToolProvider(
+        properties.provider,
+        `${eventPath}.properties.provider`
+      );
+      break;
+    }
+    case "session.next.tool.failed": {
+      assertExactKeys(
+        properties,
+        [
+          "timestamp",
+          "sessionID",
+          "assistantMessageID",
+          "callID",
+          "error",
+          "result",
+          "provider",
+        ],
+        `${eventPath}.properties`
+      );
+      assertString(properties.callID, `${eventPath}.properties.callID`);
+      if (!isRecord(properties.error)) {
+        throw new Error(`${eventPath}.properties.error must be an object`);
+      }
+      assertToolProvider(
+        properties.provider,
+        `${eventPath}.properties.provider`
+      );
+      break;
+    }
   }
 }
 
@@ -384,6 +523,13 @@ function replayFixture(events: FixtureEvent[]): CollectorState {
         break;
       case "session.next.text.delta":
         state = collector.onTextDelta(state, event.properties);
+        break;
+      case "session.next.tool.called":
+        state = collector.onToolCalled(state, event.properties);
+        break;
+      case "session.next.tool.success":
+      case "session.next.tool.failed":
+        state = collector.onToolEnded(state, event.properties);
         break;
       case "session.next.step.ended":
         state = collector.onStepEnded(state, event.properties);
@@ -600,6 +746,23 @@ const handlerPhaseMatrix: HandlerMatrixCase[] = [
       collector.onTextDelta(state, ev.textDelta("abcd", "target")),
   },
   {
+    name: "onToolCalled",
+    expected: preserveAll,
+    changesFrom: ["decoding"],
+    invoke: (collector, state) =>
+      collector.onToolCalled(state, ev.toolCalled("call-1", 1300, "target")),
+  },
+  {
+    name: "onToolEnded",
+    expected: preserveAll,
+    changesFrom: [],
+    invoke: (collector, state) =>
+      collector.onToolEnded(
+        state,
+        ev.toolSucceeded("call-1", 1300, "target")
+      ),
+  },
+  {
     name: "onStepEnded",
     expected: { ...preserveAll, prefilling: "idle", decoding: "done" },
     changesFrom: ["prefilling", "decoding"],
@@ -708,6 +871,19 @@ function expectedMatrixState(
       ttft: 200,
       liveChars: 9,
       liveEstimate: null,
+    });
+  }
+  if (handlerName === "onToolCalled" && phase === "decoding") {
+    return withCurrent({
+      phase: "decoding",
+      sessionID: "target",
+      assistantMessageID: "msg1",
+      t0: 1000,
+      t1: 1200,
+      ttft: 200,
+      liveChars: 5,
+      liveEstimate: null,
+      toolIntervals: [{ callID: "call-1", start: 1300 }],
     });
   }
   if (handlerName === "tick" && phase === "decoding") {
@@ -2093,6 +2269,189 @@ describe("SpeedCollector", () => {
       ttft: 200,
       prefillTokPerSec: 500,
       decodeTokPerSec: 50,
+    });
+  });
+
+  describe("tool execution time exclusion", () => {
+    it("replays the tool-execution fixture, excluding the tool interval from decode time", () => {
+      const state = replayFixture(
+        validateFixture(toolExecutionFixture, "tool-execution.json")
+      );
+      const current = state.get("tool-exec-session")?.current;
+
+      expect(current).toMatchObject({
+        phase: "done",
+        ttft: 500,
+        prefillTokPerSec: 240,
+      });
+      expect(state.get("tool-exec-session")?.stepHistory).toHaveLength(1);
+      // Decode window 61,100 - 500 = 60,600 ms; tool [1,000, 61,000] = 60,000 ms.
+      // Corrected decode time = 600 ms -> 50 / 0.6 = 83.33 tok/s.
+      const decodeTokPerSec =
+        current?.phase === "done" ? current.decodeTokPerSec : NaN;
+      expect(decodeTokPerSec).toBeCloseTo(50 / 0.6);
+      // The pre-fix formula counted the whole 60.6 s window: 50 / 60.6 = 0.83 tok/s.
+      expect(decodeTokPerSec).toBeGreaterThan(80);
+    });
+
+    it("keeps tool-free finish=stop steps on the existing decode formula", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = collector.onStepEnded(state, ev.stepEnded(2500, 80, 20));
+
+      expect(state.get("s1")?.current).toMatchObject({
+        phase: "done",
+        decodeTokPerSec: 50,
+      });
+    });
+
+    it("subtracts the union of overlapping parallel tool intervals exactly once", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 1000));
+      state = collector.onToolCalled(state, ev.toolCalled("b", 2000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 3000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("b", 4000));
+      state = collector.onStepEnded(state, ev.stepEnded(6000, 10));
+
+      const current = state.get("s1")?.current;
+      // Union of [1000, 3000] and [2000, 4000] is [1000, 4000] = 3000 ms.
+      // Decode window 5,500 - 3,000 = 2,500 ms -> 10 / 2.5 = 4 tok/s.
+      // A naive sum would double count 2,000 ms and report 10 / 1.5 = 6.67 tok/s.
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(4);
+    });
+
+    it("closes a tool interval on tool.failed", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = collector.onToolCalled(state, ev.toolCalled("c", 1000));
+      state = collector.onToolEnded(state, ev.toolFailed("c", 5000));
+      state = collector.onStepEnded(state, ev.stepEnded(6000, 10));
+
+      const current = state.get("s1")?.current;
+      // Decode window 5,500 - 4,000 = 1,500 ms -> 10 / 1.5 = 6.67 tok/s.
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(
+        10 / 1.5
+      );
+    });
+
+    it("clamps an interval still open at step end to the decode window", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = collector.onToolCalled(state, ev.toolCalled("open", 52000));
+      state = collector.onStepEnded(state, ev.stepEnded(61100, 50));
+
+      const current = state.get("s1")?.current;
+      // Open interval clamps to [52,000, 61,100] = 9,100 ms.
+      // Decode window 60,600 - 9,100 = 51,500 ms -> 50 / 51.5 tok/s.
+      expect(current?.phase).toBe("done");
+      if (current?.phase !== "done") return;
+      expect(Number.isFinite(current.decodeTokPerSec)).toBe(true);
+      expect(current.decodeTokPerSec).toBeCloseTo(50 / 51.5);
+    });
+
+    it("reports zero decode speed when tools consume the whole decode window", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = collector.onToolCalled(state, ev.toolCalled("all", 500));
+      state = collector.onToolEnded(state, ev.toolSucceeded("all", 60000));
+      state = collector.onStepEnded(state, ev.stepEnded(60000, 10));
+
+      const current = state.get("s1")?.current;
+      expect(current).toMatchObject({ phase: "done", decodeTokPerSec: 0 });
+      expect(
+        current?.phase === "done" &&
+          Number.isFinite(current.decodeTokPerSec)
+      ).toBe(true);
+    });
+
+    it("freezes the live estimate while a tool is running", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("tool", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500, "tool"));
+      state = collector.onTextDelta(state, ev.textDelta("1234567890", "tool"));
+      state = collector.onStepStarted(state, ev.stepStarted("plain", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500, "plain"));
+      state = collector.onTextDelta(state, ev.textDelta("1234567890", "plain"));
+
+      state = collector.tick(state, 900);
+      expect(state.get("tool")?.current).toMatchObject({ liveEstimate: 25 });
+      expect(state.get("plain")?.current).toMatchObject({ liveEstimate: 25 });
+
+      state = collector.onToolCalled(state, ev.toolCalled("c", 1000, "tool"));
+      state = collector.tick(state, 5000);
+
+      // The session running a tool keeps its last estimate...
+      expect(state.get("tool")?.current).toMatchObject({ liveEstimate: 25 });
+      // ...while a session without tools keeps updating from elapsed time.
+      const plain = state.get("plain")?.current;
+      expect(plain?.phase === "decoding" && plain.liveEstimate).toBeCloseTo(
+        10 / 4.5
+      );
+
+      // Once the tool finishes, the estimate resumes updating.
+      state = collector.onToolEnded(state, ev.toolSucceeded("c", 6000, "tool"));
+      state = collector.tick(state, 7000);
+      const resumed = state.get("tool")?.current;
+      expect(resumed?.phase === "decoding" && resumed.liveEstimate).toBeCloseTo(
+        10 / 6.5
+      );
+    });
+
+    it("ignores tool events outside decoding and unknown callIDs", () => {
+      const collector = new SpeedCollector();
+
+      const idle = stateAtPhase("idle");
+      expect(
+        collector.onToolCalled(idle, ev.toolCalled("call-1", 1000, "target"))
+      ).toBe(idle);
+      expect(
+        collector.onToolEnded(
+          idle,
+          ev.toolSucceeded("call-1", 1000, "target")
+        )
+      ).toBe(idle);
+
+      const decoding = stateAtPhase("decoding");
+      expect(
+        collector.onToolEnded(
+          decoding,
+          ev.toolSucceeded("missing", 1000, "target")
+        )
+      ).toBe(decoding);
+    });
+
+    it("ignores duplicate tool.called and tool.ended deliveries", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+
+      state = collector.onToolCalled(state, ev.toolCalled("call-1", 1000));
+      const afterCalled = stateSnapshot(state);
+      state = collector.onToolCalled(state, ev.toolCalled("call-1", 1000));
+      expect(stateSnapshot(state)).toEqual(afterCalled);
+
+      state = collector.onToolEnded(state, ev.toolSucceeded("call-1", 4000));
+      const afterEnded = stateSnapshot(state);
+      state = collector.onToolEnded(state, ev.toolSucceeded("call-1", 4000));
+      expect(stateSnapshot(state)).toEqual(afterEnded);
+    });
+
+    it("does not mutate the CollectorState passed to tool handlers", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = expectPureCall(state, (input) =>
+        collector.onToolCalled(input, ev.toolCalled("call-1", 1000))
+      );
+      expectPureCall(state, (input) =>
+        collector.onToolEnded(input, ev.toolSucceeded("call-1", 4000))
+      );
     });
   });
 });

@@ -775,11 +775,13 @@ vLLM サーバーは `http://172-25-4-137.tailcd0071.ts.net:8888/v1` で稼働�
   - v1 経路では `step-start` part が真の開始なので TTFT は正常に計測できる。実 DB（`~/.local/share/opencode/opencode.db`）で全 step の step-start part の `time_created` と、その step 内で最初に現れる text/reasoning part の `time.start` の差を集計すると `n=1416, min=0, p25=2, p50=7, mean=260, p75=502, max=1476`（ms）であり、中央値 7 ms で `step-start` は first token より前に来る（負値なし）。
   - §1.1 の前提（`t0` = step 開始）と矛盾する。**別 Issue として扱う（今回は未修正）。**
 - **v1 fallback では decode 窓の両端とツール区間で時刻ソースが混在する**
-  - `src/index.tsx:319` の `const now = Date.now()` がクライアント時刻であり、`step-start`（:322-328）と `step-finish`（:332-337）へ渡される。`t1`（first token）も `message.part.delta` 受信時の `Date.now()` である。
+  - `src/index.tsx:319` の `const now = Date.now()` がクライアント時刻であり、`step-start`（:322-328）と `step-finish`（:332-337）へ渡される。`t1`（first token）も `message.part.delta` 受信時の `Date.now()`（`src/index.tsx:381`）である。
   - 一方ツール区間は `src/index.tsx:350-366` で tool part の `state.time.start` / `state.time.end` を無変換で `onToolCalled` / `onToolEnded` へ渡す。これは §3.2 のとおりクライアントの `Date.now()` ではなく SDK が記録したサーバー時刻である。
-  - `toolBusyMs()`（`src/collector.ts:172-177`）は区間を `[t1, stepEnded]` へ clamp するため、2つの時刻ソースがずれているとツール区間が窓の外と判定されて丸ごと捨てられ、減算が行われない。
-  - 再現例: クライアント `t1 = 12,500`、`step-finish = 73,150`、サーバー時計が1時間進んでおり実際のツール実行 `13,000..73,000` が `state.time = 3,613,000..3,673,000` として記録される。`output = 50` のとき `toolBusyMs` は区間を窓外として捨て、期待 76.9 tok/s に対し実際 0.824 tok/s になる。
-  - 顕在化するのは opencode server がクライアントと別マシンで動作し、かつ両者の時計がずれている場合に限られる。同一マシンの通常のローカル利用では両者が同じ `Date.now()` の時計を参照するため差は配送遅延（ミリ秒オーダー）だけで、実害は生じない。
+  - `toolBusyMs()`（`src/collector.ts:172-177`）は区間を `[t1, stepEnded]` へ clamp する。ずれがおおむね窓長を超える場合はツール区間が窓の外と判定されて丸ごと捨てられ、減算が行われない。ずれが窓長より小さい場合は clamp により区間の一部だけが残り、誤った量が減算される。
+  - 再現例（完全脱落）: クライアント `t1 = 12,500`、`step-finish = 73,150`、サーバー時計が1時間進んでおり実際のツール実行 `13,000..73,000` が `state.time = 3,613,000..3,673,000` として記録される。`output = 50` のとき `toolBusyMs` は区間を窓外として捨て、期待 76.9 tok/s に対し実際 0.824 tok/s になる。
+  - 再現例（部分減算）: クライアント `t1 = 12,500`、`step-finish = 73,150`、実際のツール実行 `13,000..73,000`、`output = 50`。サーバー時計が +5,000 ms ずれて `state.time = 18,000..78,000` と記録された場合、`clipped = [max(18000,12500), min(78000,73150)] = [18,000, 73,150]` より `toolBusy = 55,150 ms`、`decode = 60,650 - 55,150 = 5,500 ms` となって **9.09 tok/s** になる。正しい値は 76.9 tok/s、完全脱落時は 0.824 tok/s。
+  - 誤差の顕在化は時計ずれに限らない。**両者の時計が完全に同期していても、配送遅延の差だけで誤差が生じる。** 再現例: サーバー基準で first token `12,500`、tool `13,000..73,000`、step-finish `73,150` のとき、クライアント受信が first delta `15,000`（2,500 ms 遅延）・step-finish `74,150`（1,000 ms 遅延）になると実装の出力は **43.478 tok/s**（`decodeTokPerSec = 43.47826086956522`）となり、サーバー基準の期待値 `50 / (60,650 - 60,000) ms` = **76.923 tok/s** を下回る。
+  - 誤差の大きさは「窓の両端の配送遅延の差」に比例する。同一マシンのローカル利用では通常ミリ秒オーダーで影響は小さいが、**ゼロではない**。時計が大きくずれる場合（別マシン構成など）は、上記のとおり部分減算または完全脱落として誤差が大きくなる。
   - **v2 経路はこの問題の影響を受けない。** v2 は窓の両端もツール区間もすべて `session.next.*` イベントの `timestamp`（同一ソース）を使う。
   - 将来解消する場合の選択肢: (a) v1 の窓の両端も part のサーバー時刻から取る（TTFT / prefill の計測にも波及するため要注意）、(b) ツール区間もクライアント時刻に揃える（配送遅延の分だけ精度が落ちる）。どちらを採るかは未決定。
 - **v2 では continuation ごとに `assistantMessageID` が変わりうる**

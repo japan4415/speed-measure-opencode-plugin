@@ -1,0 +1,77 @@
+[
+  {
+    "id": "evt-tool-exec-step-started",
+    "type": "session.next.step.started",
+    "properties": {
+      "sessionID": "tool-exec-session",
+      "assistantMessageID": "tool-exec-message",
+      "timestamp": 0,
+      "agent": "default",
+      "model": { "id": "deepseek-v4.1-flash", "providerID": "vllm" }
+    }
+  },
+  {
+    "id": "evt-tool-exec-text-started",
+    "type": "session.next.text.started",
+    "properties": {
+      "sessionID": "tool-exec-session",
+      "assistantMessageID": "tool-exec-message",
+      "textID": "text-1",
+      "timestamp": 500
+    }
+  },
+  {
+    "id": "evt-tool-exec-text-delta",
+    "type": "session.next.text.delta",
+    "properties": {
+      "sessionID": "tool-exec-session",
+      "assistantMessageID": "tool-exec-message",
+      "textID": "text-1",
+      "timestamp": 600,
+      "delta": "Let me run that command."
+    }
+  },
+  {
+    "id": "evt-tool-exec-called",
+    "type": "session.next.tool.called",
+    "properties": {
+      "sessionID": "tool-exec-session",
+      "assistantMessageID": "tool-exec-message",
+      "timestamp": 1000,
+      "callID": "call-1",
+      "tool": "bash",
+      "input": { "command": "sleep 60" },
+      "provider": { "executed": false }
+    }
+  },
+  {
+    "id": "evt-tool-exec-success",
+    "type": "session.next.tool.success",
+    "properties": {
+      "sessionID": "tool-exec-session",
+      "assistantMessageID": "tool-exec-message",
+      "timestamp": 61000,
+      "callID": "call-1",
+      "structured": {},
+      "content": [],
+      "provider": { "executed": false }
+    }
+  },
+  {
+    "id": "evt-tool-exec-step-ended",
+    "type": "session.next.step.ended",
+    "properties": {
+      "sessionID": "tool-exec-session",
+      "assistantMessageID": "tool-exec-message",
+      "timestamp": 61100,
+      "finish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 120,
+        "output": 50,
+        "reasoning": 0,
+        "cache": { "read": 0, "write": 0 }
+      }
+    }
+  }
+]

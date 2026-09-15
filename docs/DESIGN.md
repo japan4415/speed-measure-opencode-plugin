@@ -316,7 +316,9 @@ tick(state: CollectorState, now: number = Date.now()): CollectorState {
     const est = running
       ? m.current.liveEstimate
       : (() => {
-          const elapsed = (now - m.current.t1) / 1000;
+          // 閉じた区間の union 長を経過時間から減算する（onStepEnded と同じ式）
+          const toolBusy = toolBusyMs(m.current.toolIntervals, m.current.t1, now);
+          const elapsed = (now - m.current.t1 - toolBusy) / 1000;
           return elapsed > 0.1 ? m.current.liveChars / elapsed : null;
         })();
     updated.set(sid, { ...m, current: { ...m.current, liveEstimate: est } });
@@ -326,7 +328,9 @@ tick(state: CollectorState, now: number = Date.now()): CollectorState {
 ```
 
 閉じていないツール区間がある間は、経過時間だけが伸びて `chars/s` が 0 へ引きずられるため、
-直前の `liveEstimate` を凍結する。ツール終了後の次の tick で再計算される。
+直前の `liveEstimate` を凍結する。ツール終了後の次の tick では、`onStepEnded` と同じ
+`toolBusyMs` で閉じた区間の union 長を経過時間から減算して再計算する。これにより、
+ツール終了直後に raw な経過時間へ戻って除外済みのツール実行時間が再び分母へ入ることを防ぐ。
 
 `liveEstimate` は文字数÷経過秒であり、表示単位は `chars/s` とする。確定値は
 `step_ended` のトークン数から計算して `tok/s` と表示する。文字数とトークン数の比は

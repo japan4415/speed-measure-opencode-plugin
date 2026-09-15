@@ -10,6 +10,13 @@ export type PrefillingState = {
   sessionID: string;
   assistantMessageID: string;
   t0: number;
+  /**
+   * Tool calls observed before the first token. `tool.called` can arrive while
+   * the step is still prefilling (the provider may emit a tool call before any
+   * text/reasoning), so the intervals are recorded here and carried over into
+   * `DecodingState` when the first token arrives.
+   */
+  toolIntervals?: ToolInterval[];
 };
 
 /**
@@ -247,6 +254,7 @@ export class SpeedCollector {
     const updated = new Map(state);
     const t1 = props.timestamp;
     const ttft = t1 - prev.current.t0;
+    const carried = prev.current.toolIntervals;
     const current: DecodingState = {
       phase: "decoding",
       sessionID: props.sessionID,
@@ -256,6 +264,7 @@ export class SpeedCollector {
       ttft,
       liveChars: 0,
       liveEstimate: null,
+      ...(carried && carried.length > 0 ? { toolIntervals: carried } : {}),
     };
 
     updated.set(props.sessionID, {
@@ -305,6 +314,7 @@ export class SpeedCollector {
     const updated = new Map(state);
     const t1 = props.timestamp;
     const ttft = t1 - prev.current.t0;
+    const carried = prev.current.toolIntervals;
     const current: DecodingState = {
       phase: "decoding",
       sessionID: props.sessionID,
@@ -314,6 +324,7 @@ export class SpeedCollector {
       ttft,
       liveChars: 0,
       liveEstimate: null,
+      ...(carried && carried.length > 0 ? { toolIntervals: carried } : {}),
     };
 
     updated.set(props.sessionID, {
@@ -348,32 +359,38 @@ export class SpeedCollector {
 
   /**
    * session.next.tool.called (v2) / ToolPart state.time.start (v1 fallback)
-   * decoding -> decoding (opens a tool execution interval keyed by callID)
+   * decoding -> decoding / prefilling -> prefilling
+   * (opens a tool execution interval keyed by callID)
+   * A tool call may arrive before the first token: recording it while prefilling
+   * lets `onTextStarted` / `onReasoningStarted` carry the interval into decoding.
    * Any other phase is ignored: a step without textual output never records decode speed.
    */
   onToolCalled(state: CollectorState, props: ToolCalledProps): CollectorState {
     const prev = state.get(props.sessionID);
-    if (!prev || prev.current.phase !== "decoding") {
+    if (!prev) {
       return state;
     }
 
-    const existing = prev.current.toolIntervals ?? [];
+    const current = prev.current;
+    if (current.phase !== "decoding" && current.phase !== "prefilling") {
+      return state;
+    }
+
+    const existing = current.toolIntervals ?? [];
     if (existing.some((interval) => interval.callID === props.callID)) {
       return state;
     }
 
     const updated = new Map(state);
-    const current: DecodingState = {
-      ...prev.current,
-      toolIntervals: [
-        ...existing,
-        { callID: props.callID, start: props.timestamp },
-      ],
-    };
-
     updated.set(props.sessionID, {
       ...prev,
-      current,
+      current: {
+        ...current,
+        toolIntervals: [
+          ...existing,
+          { callID: props.callID, start: props.timestamp },
+        ],
+      },
     });
     return updated;
   }
@@ -381,16 +398,22 @@ export class SpeedCollector {
   /**
    * session.next.tool.success / session.next.tool.failed (v2)
    * ToolPart state.time.end (v1 fallback)
-   * decoding -> decoding (closes the matching open tool execution interval)
+   * decoding -> decoding / prefilling -> prefilling
+   * (closes the matching open tool execution interval)
    * Unknown callIDs and other phases are ignored.
    */
   onToolEnded(state: CollectorState, props: ToolEndedProps): CollectorState {
     const prev = state.get(props.sessionID);
-    if (!prev || prev.current.phase !== "decoding") {
+    if (!prev) {
       return state;
     }
 
-    const existing = prev.current.toolIntervals;
+    const current = prev.current;
+    if (current.phase !== "decoding" && current.phase !== "prefilling") {
+      return state;
+    }
+
+    const existing = current.toolIntervals;
     if (!existing || existing.length === 0) {
       return state;
     }
@@ -406,14 +429,12 @@ export class SpeedCollector {
     const updated = new Map(state);
     const toolIntervals = existing.slice();
     toolIntervals[index] = { ...toolIntervals[index], end: props.timestamp };
-    const current: DecodingState = {
-      ...prev.current,
-      toolIntervals,
-    };
-
     updated.set(props.sessionID, {
       ...prev,
-      current,
+      current: {
+        ...current,
+        toolIntervals,
+      },
     });
     return updated;
   }

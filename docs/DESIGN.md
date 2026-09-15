@@ -203,6 +203,7 @@ export type IdleState       = { phase: "idle" };
 export type PrefillingState = {
   phase: "prefilling";
   sessionID: string; assistantMessageID: string; t0: number;
+  toolIntervals?: ToolInterval[];   // 最初のトークンより前にツール呼び出しを観測した場合のみ存在
 };
 export type ToolInterval = {
   callID: string;
@@ -242,12 +243,12 @@ export type CollectorState = Map<string, SessionMetrics>;  // key = sessionID
 | イベント | 遷移前 | 遷移後 | アクション |
 |---------|--------|--------|-----------|
 | `session.next.step.started` | any | prefilling | t0 = ev.properties.timestamp |
-| `session.next.reasoning.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0 |
+| `session.next.reasoning.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0; prefilling 中に記録した `toolIntervals` を引き継ぐ |
 | `session.next.reasoning.delta` | decoding | decoding | liveChars += delta.length |
-| `session.next.text.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0 |
+| `session.next.text.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0; prefilling 中に記録した `toolIntervals` を引き継ぐ |
 | `session.next.text.delta`   | decoding | decoding | liveChars += delta.length |
-| `session.next.tool.called`  | decoding | decoding | toolIntervals に `{ callID, start }` を追加（開始は引数生成後。引数生成時間は decode 窓に残す） |
-| `session.next.tool.success` / `session.next.tool.failed` | decoding | decoding | 一致する開いた区間を `end` で閉じる |
+| `session.next.tool.called`  | prefilling / decoding | 同左 | `toolIntervals` に `{ callID, start }` を追加（開始は引数生成後。引数生成時間は decode 窓に残す） |
+| `session.next.tool.success` / `session.next.tool.failed` | prefilling / decoding | 同左 | 一致する開いた区間を `end` で閉じる |
 | `session.next.step.ended`   | decoding | done | `decodeTokPerSec = (output + reasoning) / ((timestamp − t1 − tool_busy) / 1000)`; stepHistory に追加 |
 | `session.next.step.ended`   | prefilling | idle | テキストなしステップ → 無視 |
 | `session.next.step.failed`  | any | error | |
@@ -264,6 +265,17 @@ export type CollectorState = Map<string, SessionMetrics>;  // key = sessionID
 > ツール実行区間の開始は `session.next.tool.called`（= tool-input 生成が終わった後）、終了は
 > `session.next.tool.success` / `session.next.tool.failed`。tool 呼び出しの引数生成時間は decode 窓に残す
 > （分子の `tokens.output` が tool-call 引数トークンを含むため）。
+
+> **first token より先に届くツール呼び出し（prefilling 区間）**
+>
+> provider は first token（text / reasoning）より先に `tool.called` を publish することがある。prefilling 中に
+> 区間を記録しないと、後続の `tool.success` は対応する開いた区間が無いため無視され、その step の decode 速度は
+> 除外前と同じ過小値になる。そのため `tool.called` / `tool.success` / `tool.failed` は prefilling 中も
+> `PrefillingState.toolIntervals` へ記録し、`text.started` / `reasoning.started` で decoding へ遷移する際に
+> `DecodingState.toolIntervals` へ引き継ぐ。`toolBusyMs` は各区間の下端を `t1` で clamp するため、prefilling
+> 区間のうち decode 窓より前の部分は二重に加算されない。
+> テキストを一切生成しない step（first token が来ないまま `step.ended`）は従来どおり idle へ遷移し、
+> decode 値を記録しない。
 
 > **イベントペイロード（`types.gen.d.ts` より確認済み）**
 >

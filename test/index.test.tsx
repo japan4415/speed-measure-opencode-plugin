@@ -4770,6 +4770,83 @@ describe("tool execution time exclusion (v2 and v1 fallback)", () => {
     }
   });
 
+  it("uses the tool part's state.time values, not the delivery timestamp, in v1 fallback", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      // Let the 2,000 ms fallback gate expire (now = 12,000).
+      vi.advanceTimersByTime(2_000);
+
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-start",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+        },
+      });
+
+      // First text delta at 12,500 -> t1 = 12,500, TTFT = 500 ms.
+      vi.advanceTimersByTime(500);
+      harness.emit("message.part.delta", {
+        sessionID: "sess-A",
+        messageID: "msg-A",
+        partID: "text-A",
+        field: "text",
+        delta: "1234567890",
+      });
+
+      // The tool part is *delivered* at 13,000, but its SDK timestamps are
+      // 20,000..80,000. A delivery-time fallback (Date.now) would record a
+      // zero-length interval at 13,000 and report ~0.6 tok/s instead.
+      vi.advanceTimersByTime(500);
+      harness.emit("message.part.updated", {
+        part: {
+          type: "tool",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+          callID: "call-1",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "sleep 60" },
+            output: "",
+            title: "bash",
+            metadata: {},
+            time: { start: 20_000, end: 80_000 },
+          },
+        },
+      });
+
+      // step-finish at 90,000 -> raw window 90,000 - 12,500 = 77,500 ms, minus
+      // the 60,000 ms tool interval = 17,500 ms -> 50 / 17.5 = 2.857 tok/s.
+      vi.advanceTimersByTime(77_000);
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-finish",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+          tokens: {
+            input: 120,
+            output: 50,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      });
+
+      const lines = sidebarLines(harness.registration(), "sess-A");
+      expect(lines[1]).toBe("Prefill: 500 ms │ 240 tok/s");
+      expect(lines[2]).toBe("Decode:  2.9 tok/s");
+
+      await harness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("freezes the v2 live estimate while a tool is running", async () => {
     vi.useFakeTimers();
     try {

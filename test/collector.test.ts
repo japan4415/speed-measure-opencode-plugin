@@ -748,7 +748,7 @@ const handlerPhaseMatrix: HandlerMatrixCase[] = [
   {
     name: "onToolCalled",
     expected: preserveAll,
-    changesFrom: ["decoding"],
+    changesFrom: ["prefilling", "decoding"],
     invoke: (collector, state) =>
       collector.onToolCalled(state, ev.toolCalled("call-1", 1300, "target")),
   },
@@ -871,6 +871,15 @@ function expectedMatrixState(
       ttft: 200,
       liveChars: 9,
       liveEstimate: null,
+    });
+  }
+  if (handlerName === "onToolCalled" && phase === "prefilling") {
+    return withCurrent({
+      phase: "prefilling",
+      sessionID: "target",
+      assistantMessageID: "msg1",
+      t0: 1000,
+      toolIntervals: [{ callID: "call-1", start: 1300 }],
     });
   }
   if (handlerName === "onToolCalled" && phase === "decoding") {
@@ -2537,7 +2546,69 @@ describe("SpeedCollector", () => {
       );
     });
 
-    it("ignores tool events outside decoding and unknown callIDs", () => {
+    it("records a tool interval that opens and closes while still prefilling", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 1000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 6000));
+      state = collector.onTextStarted(state, ev.textStarted(2000));
+      state = collector.onStepEnded(state, ev.stepEnded(7000, 50));
+
+      const current = state.get("s1")?.current;
+      // Decode window 7,000 - 2,000 = 5,000 ms; tool [1,000, 6,000] clamps to
+      // [2,000, 6,000] = 4,000 ms. 50 / (5,000 - 4,000) ms = 50 tok/s.
+      // Dropping the prefilling interval reports 50 / 5 = 10 tok/s.
+      expect(current?.phase).toBe("done");
+      if (current?.phase !== "done") return;
+      expect(current.decodeTokPerSec).toBeCloseTo(50);
+    });
+
+    it("records a tool interval opened while prefilling and closed while decoding", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 100));
+      state = collector.onTextStarted(state, ev.textStarted(200));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 60000));
+      state = collector.onStepEnded(state, ev.stepEnded(60100, 50));
+
+      const current = state.get("s1")?.current;
+      // Decode window 60,100 - 200 = 59,900 ms; tool [100, 60,000] clamps to
+      // [200, 60,000] = 59,800 ms. 50 / (59,900 - 59,800) ms = 500 tok/s.
+      // Without carrying the prefilling interval the step reports ~0.835 tok/s.
+      expect(current).toMatchObject({ phase: "done", ttft: 200 });
+      if (current?.phase !== "done") return;
+      expect(current.decodeTokPerSec).toBeCloseTo(500);
+    });
+
+    it("carries a prefilling tool interval over on reasoning.started", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 100));
+      state = collector.onReasoningStarted(state, ev.reasoningStarted(200));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 60000));
+      state = collector.onStepEnded(state, ev.stepEnded(60100, 50));
+
+      // Same arithmetic as the text.started probe: 50 / 0.1 s = 500 tok/s.
+      const current = state.get("s1")?.current;
+      expect(current).toMatchObject({ phase: "done", ttft: 200 });
+      if (current?.phase !== "done") return;
+      expect(current.decodeTokPerSec).toBeCloseTo(500);
+    });
+
+    it("still drops tool intervals for text-less steps that finish while prefilling", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 1000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 6000));
+      state = collector.onStepEnded(state, ev.stepEnded(7000, 50));
+
+      const current = state.get("s1")?.current;
+      // No first token ever arrives, so no decode value is recorded at all.
+      expect(current).toEqual({ phase: "idle" });
+      expect(state.get("s1")?.stepHistory).toHaveLength(0);
+    });
+
+    it("ignores tool events in idle and unknown callIDs", () => {
       const collector = new SpeedCollector();
 
       const idle = stateAtPhase("idle");

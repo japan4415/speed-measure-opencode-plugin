@@ -57,6 +57,9 @@ const V2_EVENT_NAMES = [
   "session.next.reasoning.delta",
   "session.next.text.started",
   "session.next.text.delta",
+  "session.next.tool.called",
+  "session.next.tool.success",
+  "session.next.tool.failed",
   "session.next.step.ended",
   "session.next.step.failed",
   "session.status",
@@ -2133,7 +2136,7 @@ describe("plugin.tui - event isolation cross-product matrix", () => {
 });
 
 describe("plugin.tui - generalized multi-session lifecycle and configuration", () => {
-  it("registers one default-order sidebar slot and all nine v2 events for all sessions", async () => {
+  it("registers one default-order sidebar slot and all twelve v2 events for all sessions", async () => {
     vi.useFakeTimers();
     const harness = createApiHarness();
 
@@ -2273,7 +2276,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     });
     vi.advanceTimersByTime(2_000);
 
-    expect(harness.eventOn).toHaveBeenCalledTimes(9);
+    expect(harness.eventOn).toHaveBeenCalledTimes(12);
     expect(harness.handlers.has("message.part.updated")).toBe(false);
     expect(harness.handlers.has("message.part.delta")).toBe(false);
     expect(sidebarLines(harness.registration(), "sess-A")[1]).toBe("Prefill: …");
@@ -2343,7 +2346,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     expect(vi.getTimerCount()).toBe(2);
     await beforeFallback.dispose();
     expect(vi.getTimerCount()).toBe(0);
-    expect(beforeFallback.unsubscribeSpies).toHaveLength(9);
+    expect(beforeFallback.unsubscribeSpies).toHaveLength(12);
     expect(
       beforeFallback.unsubscribeSpies.every(
         (unsubscribe) => unsubscribe.mock.calls.length === 1,
@@ -2353,7 +2356,7 @@ describe("plugin.tui - generalized multi-session lifecycle and configuration", (
     const afterFallback = createApiHarness();
     await plugin.tui(afterFallback.api);
     vi.advanceTimersByTime(2_000);
-    expect(afterFallback.unsubscribeSpies).toHaveLength(11);
+    expect(afterFallback.unsubscribeSpies).toHaveLength(14);
     harnessEmitBoth(afterFallback);
 
     await afterFallback.dispose();
@@ -4599,6 +4602,295 @@ describe("default cache value when tokens.cache is omitted (BB4)", () => {
 
       const lines = sidebarLines(harness.registration(), "sess-A");
       expect(lines[1]).toMatch(/│ cache 0$/);
+
+      await harness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("tool execution time exclusion (v2 and v1 fallback)", () => {
+  it("excludes the tool execution interval from v2 decode speed", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      harness.emit("session.next.step.started", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        timestamp: 0,
+      });
+      harness.emit("session.next.text.started", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        textID: "text-A",
+        timestamp: 500,
+      });
+      harness.emit("session.next.tool.called", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        timestamp: 1_000,
+        callID: "call-1",
+        tool: "bash",
+        input: { command: "sleep 60" },
+        provider: { executed: false },
+      });
+      harness.emit("session.next.tool.success", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        timestamp: 61_000,
+        callID: "call-1",
+        structured: {},
+        content: [],
+        provider: { executed: false },
+      });
+      harness.emit("session.next.step.ended", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        timestamp: 61_100,
+        finish: "stop",
+        cost: 0,
+        tokens: {
+          input: 120,
+          output: 50,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+      });
+
+      const lines = sidebarLines(harness.registration(), "sess-A");
+      // Decode window 61,100 - 500 = 60,600 ms; tool [1,000, 61,000] = 60,000 ms.
+      // 50 tokens / 0.6 s = 83.3 tok/s (pre-fix this displayed 0.8 tok/s).
+      expect(lines[1]).toBe("Prefill: 500 ms │ 240 tok/s");
+      expect(lines[2]).toBe("Decode:  83.3 tok/s");
+
+      await harness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("excludes the tool execution interval from v1 fallback decode speed", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      // Let the 2,000 ms fallback gate expire (now = 12,000).
+      vi.advanceTimersByTime(2_000);
+
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-start",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+        },
+      });
+
+      // First text delta at 12,500 -> t1 = 12,500, TTFT = 500 ms.
+      vi.advanceTimersByTime(500);
+      harness.emit("message.part.delta", {
+        sessionID: "sess-A",
+        messageID: "msg-A",
+        partID: "text-A",
+        field: "text",
+        delta: "1234567890",
+      });
+
+      // Tool starts at 13,000 while it is still running.
+      vi.advanceTimersByTime(500);
+      harness.emit("message.part.updated", {
+        part: {
+          type: "tool",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+          callID: "call-1",
+          tool: "bash",
+          state: {
+            status: "running",
+            input: { command: "sleep 60" },
+            time: { start: 13_000 },
+          },
+        },
+      });
+
+      // Tool completes at 73,000 (60,000 ms after it started).
+      vi.advanceTimersByTime(60_000);
+      harness.emit("message.part.updated", {
+        part: {
+          type: "tool",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+          callID: "call-1",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "sleep 60" },
+            output: "",
+            title: "bash",
+            metadata: {},
+            time: { start: 13_000, end: 73_000 },
+          },
+        },
+      });
+
+      // The next live tick lands at 73,150: elapsed 60,650 ms minus the closed
+      // tool interval 60,000 ms = 650 ms -> 10 / 0.65 = 15.38 chars/s. The tool
+      // time must stay excluded after the interval closes.
+      vi.advanceTimersByTime(150);
+      expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe(
+        "Decode:  ~15.4 chars/s",
+      );
+
+      // step-finish at 73,150 -> raw window 60,650 ms minus tool 60,000 ms = 650 ms.
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-finish",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+          tokens: {
+            input: 120,
+            output: 50,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      });
+
+      const lines = sidebarLines(harness.registration(), "sess-A");
+      expect(lines[1]).toBe("Prefill: 500 ms │ 240 tok/s");
+      expect(lines[2]).toBe("Decode:  76.9 tok/s");
+
+      await harness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the tool part's state.time values, not the delivery timestamp, in v1 fallback", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      // Let the 2,000 ms fallback gate expire (now = 12,000).
+      vi.advanceTimersByTime(2_000);
+
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-start",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+        },
+      });
+
+      // First text delta at 12,500 -> t1 = 12,500, TTFT = 500 ms.
+      vi.advanceTimersByTime(500);
+      harness.emit("message.part.delta", {
+        sessionID: "sess-A",
+        messageID: "msg-A",
+        partID: "text-A",
+        field: "text",
+        delta: "1234567890",
+      });
+
+      // The tool part is *delivered* at 13,000, but its SDK timestamps are
+      // 20,000..80,000. A delivery-time fallback (Date.now) would record a
+      // zero-length interval at 13,000 and report ~0.6 tok/s instead.
+      vi.advanceTimersByTime(500);
+      harness.emit("message.part.updated", {
+        part: {
+          type: "tool",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+          callID: "call-1",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "sleep 60" },
+            output: "",
+            title: "bash",
+            metadata: {},
+            time: { start: 20_000, end: 80_000 },
+          },
+        },
+      });
+
+      // step-finish at 90,000 -> raw window 90,000 - 12,500 = 77,500 ms, minus
+      // the 60,000 ms tool interval = 17,500 ms -> 50 / 17.5 = 2.857 tok/s.
+      vi.advanceTimersByTime(77_000);
+      harness.emit("message.part.updated", {
+        part: {
+          type: "step-finish",
+          sessionID: "sess-A",
+          messageID: "msg-A",
+          tokens: {
+            input: 120,
+            output: 50,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      });
+
+      const lines = sidebarLines(harness.registration(), "sess-A");
+      expect(lines[1]).toBe("Prefill: 500 ms │ 240 tok/s");
+      expect(lines[2]).toBe("Decode:  2.9 tok/s");
+
+      await harness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("freezes the v2 live estimate while a tool is running", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100_000);
+      const harness = createApiHarness();
+      await plugin.tui(harness.api);
+
+      harness.emit("session.next.step.started", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        timestamp: 100_000,
+      });
+      harness.emit("session.next.text.started", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        textID: "text-A",
+        timestamp: 100_050,
+      });
+      harness.emit("session.next.text.delta", {
+        sessionID: "sess-A",
+        delta: "1234567890",
+      });
+
+      // Tick at 100,450 -> 10 chars / 0.4 s = 25 chars/s.
+      vi.advanceTimersByTime(450);
+      expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe(
+        "Decode:  ~25 chars/s",
+      );
+
+      harness.emit("session.next.tool.called", {
+        sessionID: "sess-A",
+        assistantMessageID: "msg-A",
+        timestamp: 100_500,
+        callID: "call-1",
+        tool: "bash",
+        input: { command: "sleep 60" },
+        provider: { executed: false },
+      });
+
+      // 1.5 s pass while the tool runs; the frozen estimate must not decay.
+      vi.advanceTimersByTime(1_500);
+      expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe(
+        "Decode:  ~25 chars/s",
+      );
 
       await harness.dispose();
     } finally {

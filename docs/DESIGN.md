@@ -25,8 +25,13 @@
 
 **Decode（出力生成フェーズ）**
 
-- **Decode 速度** = `(tokens.output + tokens.reasoning) / ((step_ended.timestamp − t1) / 1000)` tok/s
+- **Decode 速度** = `(tokens.output + tokens.reasoning) / (decode_time / 1000)` tok/s
+  - `decode_time = step_ended.timestamp − t1 − tool_busy` (ms)
   - `t1` は first token タイムスタンプ（§1.1 TTFT と同じマーカー：reasoning.started / text.started のうち早い方）
+  - `tool_busy` は、`[t1, step_ended.timestamp]` に含まれるツール実行区間を clamp し、重複を union でマージした合計長。並列ツールで重なる区間は一度だけ減算する
+  - **`step.ended` は全 tool fiber が settle した後に publish される。** このため `step_ended.timestamp − t1` をそのまま decode 時間に使うとツール実行時間が丸ごと混入し、速度を大きく過小評価する。除外が必須である
+  - ツール実行区間の開始は `tool.called`（= tool-input 生成が終わった後）。tool 呼び出しの**引数生成時間は decode 窓に残している**。分子の `tokens.output` が tool-call 引数トークンを含むため、引数生成を除外すると意味的整合が崩れる
+  - `decode_time <= 0` の場合は `decodeTokPerSec = 0` とする
   - reasoning トークンを分子に含める理由：reasoning はデコードフェーズで順次生成されるトークンであり、総スループットの一部。vLLM の thinking モードでは reasoning が先行するため除外すると速度が過小評価される
 
 ### 1.2 サイドバーブロックのレイアウト
@@ -70,6 +75,7 @@ k 表記の小数1桁は `Number.prototype.toFixed(1)` に基づき、二進浮�
 - ツールコールを含むターンは複数の step が発生する（各 step に固有の `session.next.step.*` イベント列）
 - **直近の text 生成ステップの値**を主表示とし、`showAverages: true` 時は同一 `assistantMessageID` 内の全ステップ平均を副表示する
 - テキストを生成しないステップ（ツール実行のみ）は Prefill/Decode メトリクスを記録しない
+- 1 つの step の途中でツールが実行される場合、そのツール実行区間を decode 時間から除外する（§3.4）。`step.ended` はツール実行完了後に発火するため、区間を除外しないと decode 速度が過小になる
 - `props.session_id` と一致する `sessionID` のイベントのみ処理し、subagent セッションの値を親セッションのサイドバーに混入させない
 
 ---
@@ -197,12 +203,19 @@ export type IdleState       = { phase: "idle" };
 export type PrefillingState = {
   phase: "prefilling";
   sessionID: string; assistantMessageID: string; t0: number;
+  toolIntervals?: ToolInterval[];   // 最初のトークンより前にツール呼び出しを観測した場合のみ存在
+};
+export type ToolInterval = {
+  callID: string;
+  start: number;
+  end?: number;    // 未完了（実行中）の間は absent
 };
 export type DecodingState = {
   phase: "decoding";
   sessionID: string; assistantMessageID: string;
   t0: number; t1: number; ttft: number;
   liveChars: number; liveEstimate: number | null;
+  toolIntervals?: ToolInterval[];   // この step でツールを観測した場合のみ存在
 };
 export type DoneState = {
   phase: "done";
@@ -230,15 +243,39 @@ export type CollectorState = Map<string, SessionMetrics>;  // key = sessionID
 | イベント | 遷移前 | 遷移後 | アクション |
 |---------|--------|--------|-----------|
 | `session.next.step.started` | any | prefilling | t0 = ev.properties.timestamp |
-| `session.next.reasoning.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0 |
+| `session.next.reasoning.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0; prefilling 中に記録した `toolIntervals` を引き継ぐ |
 | `session.next.reasoning.delta` | decoding | decoding | liveChars += delta.length |
-| `session.next.text.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0 |
+| `session.next.text.started` | prefilling | decoding | t1 = timestamp（first token）; ttft = t1 − t0; prefilling 中に記録した `toolIntervals` を引き継ぐ |
 | `session.next.text.delta`   | decoding | decoding | liveChars += delta.length |
-| `session.next.step.ended`   | decoding | done | decodeTokPerSec 計算; stepHistory に追加 |
+| `session.next.tool.called`  | prefilling / decoding | 同左 | `toolIntervals` に `{ callID, start }` を追加（開始は引数生成後。引数生成時間は decode 窓に残す） |
+| `session.next.tool.success` / `session.next.tool.failed` | prefilling / decoding | 同左 | 一致する開いた区間を `end` で閉じる |
+| `session.next.step.ended`   | decoding | done | `decodeTokPerSec = (output + reasoning) / ((timestamp − t1 − tool_busy) / 1000)`; stepHistory に追加 |
 | `session.next.step.ended`   | prefilling | idle | テキストなしステップ → 無視 |
 | `session.next.step.failed`  | any | error | |
 | `session.status` (idle)     | prefilling / decoding | idle | prefilling / decoding の中断時のみ遷移。done / error は次の step.started まで維持する |
 | `session.error`             | any | error | |
+
+> **`session.next.step.ended` の発火タイミング（decode 時間の前提）**
+>
+> OpenCode は step 内のすべての tool fiber が settle した後に `session.next.step.ended` を publish する。
+> このため `step.ended.timestamp − t1` にはツール実行時間が丸ごと混入する。decode 時間は
+> `tool_busy`（`[t1, step.ended.timestamp]` に clamp したツール実行区間を union でマージした合計長）を
+> 減算して求める。並列ツールで重なる区間は二重に引かない。
+>
+> ツール実行区間の開始は `session.next.tool.called`（= tool-input 生成が終わった後）、終了は
+> `session.next.tool.success` / `session.next.tool.failed`。tool 呼び出しの引数生成時間は decode 窓に残す
+> （分子の `tokens.output` が tool-call 引数トークンを含むため）。
+
+> **first token より先に届くツール呼び出し（prefilling 区間）**
+>
+> provider は first token（text / reasoning）より先に `tool.called` を publish することがある。prefilling 中に
+> 区間を記録しないと、後続の `tool.success` は対応する開いた区間が無いため無視され、その step の decode 速度は
+> 除外前と同じ過小値になる。そのため `tool.called` / `tool.success` / `tool.failed` は prefilling 中も
+> `PrefillingState.toolIntervals` へ記録し、`text.started` / `reasoning.started` で decoding へ遷移する際に
+> `DecodingState.toolIntervals` へ引き継ぐ。`toolBusyMs` は各区間の下端を `t1` で clamp するため、prefilling
+> 区間のうち decode 窓より前の部分は二重に加算されない。
+> テキストを一切生成しない step（first token が来ないまま `step.ended`）は従来どおり idle へ遷移し、
+> decode 値を記録しない。
 
 > **イベントペイロード（`types.gen.d.ts` より確認済み）**
 >
@@ -269,27 +306,43 @@ setTimeout(() => {
 function activateV1Fallback(...) {
   // message.part.updated (step-start part) → t0 = Date.now()
   // message.part.delta (field="text", first occurrence) → t1 = Date.now()
-  // message.part.updated (step-finish part) → tokens, t2 = Date.now()
+  // message.part.updated (tool part) → state.time.start で区間開始、state.time.end で区間終了
+  // message.part.updated (step-finish part) → tokens, decodeTokPerSec = tokens / ((now − t1 − tool_busy) / 1000)
 }
 ```
 
 v1 fallback では `tokens.input` は `StepFinishPart.tokens.input` から取得。`TextPart.time.start` は optional のため信頼しない。
+v1 fallback のツール区間は tool part の `state.time.start` / `state.time.end`（クライアント時刻ではなく SDK が記録した時刻）から取得し、
+v2 と同じ `tool_busy` の union 減算を適用する。
 
 ### 3.3 ライブデコード推定
 
 ```ts
 // collector.ts の tick() メソッド（setInterval から呼ばれる）
-tick(state: CollectorState): CollectorState {
+tick(state: CollectorState, now: number = Date.now()): CollectorState {
   const updated = new Map(state);
   for (const [sid, m] of updated) {
     if (m.current.phase !== "decoding") continue;
-    const elapsed = (Date.now() - m.current.t1) / 1000;
-    const est = elapsed > 0.1 ? m.current.liveChars / elapsed : null;
+    // 閉じていないツール区間がある間は直前の liveEstimate を凍結する
+    const running = (m.current.toolIntervals ?? []).some((i) => i.end === undefined);
+    const est = running
+      ? m.current.liveEstimate
+      : (() => {
+          // 閉じた区間の union 長を経過時間から減算する（onStepEnded と同じ式）
+          const toolBusy = toolBusyMs(m.current.toolIntervals, m.current.t1, now);
+          const elapsed = (now - m.current.t1 - toolBusy) / 1000;
+          return elapsed > 0.1 ? m.current.liveChars / elapsed : null;
+        })();
     updated.set(sid, { ...m, current: { ...m.current, liveEstimate: est } });
   }
   return updated;
 }
 ```
+
+閉じていないツール区間がある間は、経過時間だけが伸びて `chars/s` が 0 へ引きずられるため、
+直前の `liveEstimate` を凍結する。ツール終了後の次の tick では、`onStepEnded` と同じ
+`toolBusyMs` で閉じた区間の union 長を経過時間から減算して再計算する。これにより、
+ツール終了直後に raw な経過時間へ戻って除外済みのツール実行時間が再び分母へ入ることを防ぐ。
 
 `liveEstimate` は文字数÷経過秒であり、表示単位は `chars/s` とする。確定値は
 `step_ended` のトークン数から計算して `tok/s` と表示する。文字数とトークン数の比は
@@ -301,7 +354,9 @@ tick(state: CollectorState): CollectorState {
 ```ts
 // session.next.step.ended ハンドラ内
 // t1 = first token タイムスタンプ（reasoning.started または text.started のうち早い方）
-const decodeTimeSec = (stepEndedTs - t1) / 1000;
+// toolBusyMs = [t1, stepEndedTs] に clamp したツール実行区間の union 長（並列の重複は1回だけ数える）
+const toolBusy = toolBusyMs(current.toolIntervals, t1, stepEndedTs);
+const decodeTimeSec = (stepEndedTs - t1 - toolBusy) / 1000;
 const decodeTokPerSec = decodeTimeSec > 0
   ? (tokens.output + tokens.reasoning) / decodeTimeSec
   : 0;
@@ -313,6 +368,10 @@ const prefillTokPerSec = calculatedPrefillTokPerSec !== null
     ? calculatedPrefillTokPerSec
     : null;
 ```
+
+`toolBusyMs` は各区間を `[t1, stepEndedTs]` へ clamp し、`end` の無い未完了区間は `stepEndedTs` で閉じたものとして扱う。
+`[t1, stepEndedTs]` が空になる区間（`end <= start`）は除外し、開始時刻でソートしたうえで重なる区間を union に統合して合計長を返す。
+分母が 0 以下なら `decodeTokPerSec = 0` とする。
 
 ---
 
@@ -703,6 +762,31 @@ vLLM サーバーは `http://172-25-4-137.tailcd0071.ts.net:8888/v1` で稼働�
 ```
 
 タスク A・B・D・E は並列実行可能。タスク C のみタスク A・B 完了を待つ。
+
+---
+
+## 9. 既知の問題
+
+いずれも本設計書の記述と実装挙動が食い違う箇所であり、未修正である。
+
+- **v2 有効時に TTFT がほぼ 0 になる**
+  - OpenCode の publisher は `case "step-start": return` で何もせず、`SessionEvent.Step.Started` は `startAssistant()` 経由で text-start / reasoning-start / tool-input-start の最初のコンテンツ片で初めて publish される。
+  - このため v2 では `t0`（`session.next.step.started`）と `t1`（first token）がほぼ同時刻になり TTFT ≈ 0 になる。
+  - v1 経路では `step-start` part が真の開始なので TTFT は正常に計測できる。実 DB（`~/.local/share/opencode/opencode.db`）で全 step の step-start part の `time_created` と、その step 内で最初に現れる text/reasoning part の `time.start` の差を集計すると `n=1416, min=0, p25=2, p50=7, mean=260, p75=502, max=1476`（ms）であり、中央値 7 ms で `step-start` は first token より前に来る（負値なし）。
+  - §1.1 の前提（`t0` = step 開始）と矛盾する。**別 Issue として扱う（今回は未修正）。**
+- **v1 fallback では decode 窓の両端とツール区間で時刻ソースが混在する**
+  - `src/index.tsx:319` の `const now = Date.now()` がクライアント時刻であり、`step-start`（:322-328）と `step-finish`（:332-337）へ渡される。`t1`（first token）も `message.part.delta` 受信時の `Date.now()`（`src/index.tsx:381`）である。
+  - 一方ツール区間は `src/index.tsx:350-366` で tool part の `state.time.start` / `state.time.end` を無変換で `onToolCalled` / `onToolEnded` へ渡す。これは §3.2 のとおりクライアントの `Date.now()` ではなく SDK が記録したサーバー時刻である。
+  - `toolBusyMs()`（`src/collector.ts:172-177`）は区間を `[t1, stepEnded]` へ clamp する。ずれがおおむね窓長を超える場合はツール区間が窓の外と判定されて丸ごと捨てられ、減算が行われない。ずれが窓長より小さい場合は clamp により区間の一部だけが残り、誤った量が減算される。
+  - 再現例（完全脱落）: クライアント `t1 = 12,500`、`step-finish = 73,150`、サーバー時計が1時間進んでおり実際のツール実行 `13,000..73,000` が `state.time = 3,613,000..3,673,000` として記録される。`output = 50` のとき `toolBusyMs` は区間を窓外として捨て、期待 76.9 tok/s に対し実際 0.824 tok/s になる。
+  - 再現例（部分減算）: クライアント `t1 = 12,500`、`step-finish = 73,150`、実際のツール実行 `13,000..73,000`、`output = 50`。サーバー時計が +5,000 ms ずれて `state.time = 18,000..78,000` と記録された場合、`clipped = [max(18000,12500), min(78000,73150)] = [18,000, 73,150]` より `toolBusy = 55,150 ms`、`decode = 60,650 - 55,150 = 5,500 ms` となって **9.09 tok/s** になる。正しい値は 76.9 tok/s、完全脱落時は 0.824 tok/s。
+  - 誤差の顕在化は時計ずれに限らない。**両者の時計が完全に同期していても、配送遅延の差だけで誤差が生じる。** 再現例: サーバー基準で first token `12,500`、tool `13,000..73,000`、step-finish `73,150` のとき、クライアント受信が first delta `15,000`（2,500 ms 遅延）・step-finish `74,150`（1,000 ms 遅延）になると実装の出力は **43.478 tok/s**（`decodeTokPerSec = 43.47826086956522`）となり、サーバー基準の期待値 `50 / (60,650 - 60,000) ms` = **76.923 tok/s** を下回る。
+  - 誤差の大きさは「窓の両端の配送遅延の差」に比例する。同一マシンのローカル利用では通常ミリ秒オーダーで影響は小さいが、**ゼロではない**。時計が大きくずれる場合（別マシン構成など）は、上記のとおり部分減算または完全脱落として誤差が大きくなる。
+  - **v2 経路はこの問題の影響を受けない。** v2 は窓の両端もツール区間もすべて `session.next.*` イベントの `timestamp`（同一ソース）を使う。
+  - 将来解消する場合の選択肢: (a) v1 の窓の両端も part のサーバー時刻から取る（TTFT / prefill の計測にも波及するため要注意）、(b) ツール区間もクライアント時刻に揃える（配送遅延の分だけ精度が落ちる）。どちらを採るかは未決定。
+- **v2 では continuation ごとに `assistantMessageID` が変わりうる**
+  - collector は `assistantMessageID` の変化で `stepHistory` をリセットする（`src/collector.ts` の `onStepStarted` 内、215 行目付近）。
+  - このため平均値表示（`showAverages: true`）が step をまたげない可能性がある。未検証。
 
 ---
 

@@ -256,11 +256,23 @@ The v2 SDK adds granular per-step/per-text events with millisecond `timestamp` f
 
 **Speed formula derivable from v2 events:**
 ```
-TTFT (ms)       = text_started.timestamp - step_started.timestamp
-Decode time (ms) = text_ended.timestamp - text_started.timestamp
-Decode speed (tok/s) = step_ended.tokens.output / (decode_time / 1000)
+TTFT (ms)        = first_token.timestamp - step_started.timestamp
+Decode time (ms) = step_ended.timestamp - first_token.timestamp - tool_busy
+Decode speed (tok/s) = (tokens.output + tokens.reasoning) / (decode_time / 1000)
 ```
-Note: `tokens.output` only arrives with `step.ended`; decode time spans `text_started` → `text_ended`.
+`first_token` is the earlier of `text.started` / `reasoning.started`. `tokens.output` only arrives with
+`step.ended`, so the decode window opens at the first token and closes at `step.ended`, not at `text.ended`.
+
+**Why `text_ended.timestamp - text_started.timestamp` alone is not usable:**
+
+- OpenCode publishes `session.next.step.ended` only after every tool fiber in the step has settled, so the raw `step_ended.timestamp - t1` span includes the whole tool execution time and heavily underestimates decode speed.
+- `text.ended` is not a reliable last-token marker either: on a real database, `msg_09343c1fd001yR6FUYmoOtaZ39` has a text span in which 3 tools executed, and `text.time.end` was recorded right after the last tool finished — the span already contains the tool execution time.
+
+The implementation therefore subtracts the union of tool execution intervals, clamped to `[t1, step_ended.timestamp]`:
+
+- `tool_busy` = total length of the merged (union) tool intervals, so overlapping parallel tool calls are subtracted once.
+- interval start = `session.next.tool.called` (after tool-input generation; the argument generation time stays inside the decode window because `tokens.output` includes tool-call argument tokens); interval end = `session.next.tool.success` / `session.next.tool.failed`.
+- If `decode_time <= 0`, decode speed is 0.
 
 **Full v2 Event type** is a large union (line 4): includes all the `session.next.*` events above plus `message.part.delta`, `session.error`, `session.status`, `session.idle`, and many others.
 

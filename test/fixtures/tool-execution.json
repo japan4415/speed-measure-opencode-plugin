@@ -64,7 +64,7 @@
       "sessionID": "tool-exec-session",
       "assistantMessageID": "tool-exec-message",
       "timestamp": 61100,
-      "finish": "stop",
+      "finish": "tool-calls",
       "cost": 0,
       "tokens": {
         "input": 120,

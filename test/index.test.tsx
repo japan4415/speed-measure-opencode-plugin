@@ -4697,10 +4697,11 @@ describe("tool execution time exclusion (v2 and v1 fallback)", () => {
         messageID: "msg-A",
         partID: "text-A",
         field: "text",
-        delta: "calling the bash tool now",
+        delta: "1234567890",
       });
 
-      // Tool runs from 13,000 to 73,000 (60,000 ms) inside the step span.
+      // Tool starts at 13,000 while it is still running.
+      vi.advanceTimersByTime(500);
       harness.emit("message.part.updated", {
         part: {
           type: "tool",
@@ -4715,6 +4716,9 @@ describe("tool execution time exclusion (v2 and v1 fallback)", () => {
           },
         },
       });
+
+      // Tool completes at 73,000 (60,000 ms after it started).
+      vi.advanceTimersByTime(60_000);
       harness.emit("message.part.updated", {
         part: {
           type: "tool",
@@ -4733,8 +4737,15 @@ describe("tool execution time exclusion (v2 and v1 fallback)", () => {
         },
       });
 
-      // step-finish at 73,100 -> raw window 60,600 ms minus tool 60,000 ms = 600 ms.
-      vi.advanceTimersByTime(60_600);
+      // The next live tick lands at 73,150: elapsed 60,650 ms minus the closed
+      // tool interval 60,000 ms = 650 ms -> 10 / 0.65 = 15.38 chars/s. The tool
+      // time must stay excluded after the interval closes.
+      vi.advanceTimersByTime(150);
+      expect(sidebarLines(harness.registration(), "sess-A")[2]).toBe(
+        "Decode:  ~15.4 chars/s",
+      );
+
+      // step-finish at 73,150 -> raw window 60,650 ms minus tool 60,000 ms = 650 ms.
       harness.emit("message.part.updated", {
         part: {
           type: "step-finish",
@@ -4751,7 +4762,7 @@ describe("tool execution time exclusion (v2 and v1 fallback)", () => {
 
       const lines = sidebarLines(harness.registration(), "sess-A");
       expect(lines[1]).toBe("Prefill: 500 ms │ 240 tok/s");
-      expect(lines[2]).toBe("Decode:  83.3 tok/s");
+      expect(lines[2]).toBe("Decode:  76.9 tok/s");
 
       await harness.dispose();
     } finally {

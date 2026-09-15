@@ -588,6 +588,9 @@ export class SpeedCollector {
    * If elapsed <= 0.1s, liveEstimate remains null.
    * While a tool is executing, the previous estimate is frozen so that a
    * growing elapsed time cannot drag chars/s down toward zero.
+   * Once every tool interval is closed, the union of those intervals is
+   * subtracted from the elapsed time, mirroring `onStepEnded` so the live
+   * value cannot regress to counting tool execution as decode time.
    */
   tick(state: CollectorState, now: number = Date.now()): CollectorState {
     let hasChanges = false;
@@ -603,7 +606,8 @@ export class SpeedCollector {
       const liveEstimate = running
         ? m.current.liveEstimate
         : (() => {
-            const elapsed = (now - m.current.t1) / 1000;
+            const toolBusy = toolBusyMs(m.current.toolIntervals, m.current.t1, now);
+            const elapsed = (now - m.current.t1 - toolBusy) / 1000;
             return elapsed > 0.1 ? m.current.liveChars / elapsed : null;
           })();
 

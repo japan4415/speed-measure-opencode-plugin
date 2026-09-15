@@ -2323,6 +2323,115 @@ describe("SpeedCollector", () => {
       expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(4);
     });
 
+    it("merges a tool interval fully nested inside another into the union", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(1000));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 2000));
+      state = collector.onToolCalled(state, ev.toolCalled("b", 3000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("b", 4000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 10000));
+      state = collector.onStepEnded(state, ev.stepEnded(11000, 10));
+
+      const current = state.get("s1")?.current;
+      // Union of [2000, 10000] with nested [3000, 4000] is [2000, 10000] = 8000 ms.
+      // Decode window 10,000 - 8,000 = 2,000 ms -> 10 / 2 = 5 tok/s.
+      // Dropping the containment guard would shrink the union to 2,000 ms (1.25 tok/s).
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(5);
+    });
+
+    it("ignores a re-delivered tool end for an already closed interval", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(1000));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 2000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 3000));
+      // A second end for the same callID must not extend the closed interval.
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 9000));
+      state = collector.onStepEnded(state, ev.stepEnded(11000, 10));
+
+      const current = state.get("s1")?.current;
+      // Union stays [2000, 3000] = 1000 ms.
+      // Decode window 10,000 - 1,000 = 9,000 ms -> 10 / 9 = 1.11 tok/s.
+      // Overwriting `end` with 9,000 would shorten decode time to 3,000 ms.
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(
+        10 / 9
+      );
+    });
+
+    it("clamps a tool interval that starts before t1 to the decode window", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(1000));
+      state = collector.onToolCalled(state, ev.toolCalled("early", 0));
+      state = collector.onToolEnded(state, ev.toolSucceeded("early", 3000));
+      state = collector.onStepEnded(state, ev.stepEnded(11000, 10));
+
+      const current = state.get("s1")?.current;
+      // The interval begins before t1, so only [1000, 3000] = 2000 ms counts.
+      // Decode window 10,000 - 2,000 = 8,000 ms -> 10 / 8 = 1.25 tok/s.
+      // Without the lower clamp the 0-1000 ms prefill span leaks another 1,000 ms.
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(
+        1.25
+      );
+    });
+
+    it("clamps a tool interval that ends after step end to the decode window", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(1000));
+      state = collector.onToolCalled(state, ev.toolCalled("late", 10500));
+      state = collector.onToolEnded(state, ev.toolSucceeded("late", 12000));
+      state = collector.onStepEnded(state, ev.stepEnded(11000, 10));
+
+      const current = state.get("s1")?.current;
+      // The interval ends after step.ended, so only [10500, 11000] = 500 ms counts.
+      // Decode window 10,000 - 500 = 9,500 ms -> 10 / 9.5 = 1.05 tok/s.
+      // Without the upper clamp the extra 1,000 ms past step end would be counted.
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(
+        10 / 9.5
+      );
+    });
+
+    it("drops tool intervals that lie entirely outside the decode window", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(1000));
+      // Ends before t1.
+      state = collector.onToolCalled(state, ev.toolCalled("before", 100));
+      state = collector.onToolEnded(state, ev.toolSucceeded("before", 500));
+      // Starts after step.ended.
+      state = collector.onToolCalled(state, ev.toolCalled("after", 11000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("after", 12000));
+      state = collector.onStepEnded(state, ev.stepEnded(11000, 10));
+
+      const current = state.get("s1")?.current;
+      // Neither interval intersects [t1, stepEnded], so tool busy time is 0.
+      // Decode window 10,000 ms -> 10 / 10 = 1 tok/s.
+      // A missing clamp turns either interval into 400 ms / 1,000 ms of busy time.
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(1);
+    });
+
+    it("computes the union regardless of interval insertion order", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(1000));
+      // Inserted in descending start order: [5000, 6000] before [2000, 3000].
+      state = collector.onToolCalled(state, ev.toolCalled("b", 5000));
+      state = collector.onToolCalled(state, ev.toolCalled("a", 2000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("a", 3000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("b", 6000));
+      state = collector.onStepEnded(state, ev.stepEnded(11000, 10));
+
+      const current = state.get("s1")?.current;
+      // Union of [2000, 3000] and [5000, 6000] is 2,000 ms.
+      // Decode window 10,000 - 2,000 = 8,000 ms -> 10 / 8 = 1.25 tok/s.
+      // Without sorting the earlier interval is dropped (1,000 ms -> 1.11 tok/s).
+      expect(current?.phase === "done" && current.decodeTokPerSec).toBeCloseTo(
+        1.25
+      );
+    });
+
     it("closes a tool interval on tool.failed", () => {
       const collector = new SpeedCollector();
       let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
@@ -2394,12 +2503,37 @@ describe("SpeedCollector", () => {
         10 / 4.5
       );
 
-      // Once the tool finishes, the estimate resumes updating.
+      // Once the tool finishes, the estimate resumes updating from the elapsed
+      // time minus the closed tool interval: (7,000 - 500 - 5,000) / 1,000 = 1.5 s
+      // -> 10 / 1.5 = 6.67 chars/s. The tool execution time stays excluded.
       state = collector.onToolEnded(state, ev.toolSucceeded("c", 6000, "tool"));
       state = collector.tick(state, 7000);
       const resumed = state.get("tool")?.current;
       expect(resumed?.phase === "decoding" && resumed.liveEstimate).toBeCloseTo(
-        10 / 6.5
+        10 / 1.5
+      );
+    });
+
+    it("subtracts a closed tool interval from the live estimate after the tool ends", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = collector.onTextDelta(state, ev.textDelta("1234567890"));
+
+      // Tick at 900 -> 10 chars / 0.4 s = 25 chars/s.
+      state = collector.tick(state, 900);
+      expect(state.get("s1")?.current).toMatchObject({ liveEstimate: 25 });
+
+      // Tool runs from 1,000 to 61,000 and then the step is still decoding.
+      state = collector.onToolCalled(state, ev.toolCalled("c", 1000));
+      state = collector.onToolEnded(state, ev.toolSucceeded("c", 61000));
+      state = collector.tick(state, 61050);
+
+      // Raw elapsed 60,550 ms minus the closed interval 60,000 ms = 550 ms
+      // -> 10 / 0.55 = 18.18 chars/s. Using the raw elapsed would report 0.17.
+      const current = state.get("s1")?.current;
+      expect(current?.phase === "decoding" && current.liveEstimate).toBeCloseTo(
+        10 / 0.55
       );
     });
 

@@ -1558,6 +1558,23 @@ describe("loadConfig", () => {
     expect(config.showAverages).toBe(true);
   });
 
+  it("prefers XDG_CONFIG_HOME over HOME for the config path", async () => {
+    vi.resetModules();
+    const expectedPath = "/xdg-config/opencode/speed-measure.json";
+    const fileSpy = vi.fn((path: string) => ({
+      text: async () => JSON.stringify({ showAverages: true }),
+    }));
+    vi.stubGlobal("Bun", {
+      env: { HOME: "/test-home", XDG_CONFIG_HOME: "/xdg-config" },
+      file: fileSpy,
+    });
+    const mod = await import("../src/index.js");
+    expect(mod.CONFIG_PATH).toBe(expectedPath);
+    const config = await mod.loadConfig();
+    expect(fileSpy).toHaveBeenCalledWith(expectedPath);
+    expect(config.showAverages).toBe(true);
+  });
+
   it("does not load config and returns default config when reading from a non-matching path", async () => {
     vi.resetModules();
     const homeDir = "/Users/discord4415";

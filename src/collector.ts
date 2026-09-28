@@ -40,6 +40,12 @@ export type DecodingState = {
   ttft: number;
   liveChars: number;
   liveEstimate: number | null;
+  /**
+   * Provider response body end (OpenCode v2 `session.step.streamed` envelope
+   * time). OpenCode publishes this boundary before tools settle, so when it is
+   * present the decode window ends here and tool intervals need no subtraction.
+   */
+  streamedTs?: number;
   /** Present only once a tool call has been observed during this step. */
   toolIntervals?: ToolInterval[];
 };
@@ -152,6 +158,11 @@ export interface ToolEndedProps {
   timestamp: number;
   assistantMessageID?: string;
   [key: string]: unknown;
+}
+
+export interface StepStreamedProps {
+  sessionID: string;
+  streamedAt: number;
 }
 
 /**
@@ -440,7 +451,30 @@ export class SpeedCollector {
   }
 
   /**
-   * session.next.step.ended
+   * session.step.streamed (v2 only)
+   * decoding -> decoding (records the provider response body boundary)
+   * Other phases are ignored: a step without textual output never records
+   * decode metrics, and `onStepEnded` already returns prefilling to idle.
+   */
+  onStepStreamed(state: CollectorState, props: StepStreamedProps): CollectorState {
+    const prev = state.get(props.sessionID);
+    if (!prev || prev.current.phase !== "decoding") {
+      return state;
+    }
+
+    const updated = new Map(state);
+    updated.set(props.sessionID, {
+      ...prev,
+      current: {
+        ...prev.current,
+        streamedTs: props.streamedAt,
+      },
+    });
+    return updated;
+  }
+
+  /**
+   * session.next.step.ended / session.step.ended
    * decoding -> done (calculates decodeTokPerSec, appends to stepHistory)
    * prefilling -> idle (step without generating text, e.g. tool execution)
    */
@@ -465,11 +499,15 @@ export class SpeedCollector {
       const t1 = prev.current.t1;
       const ttft = prev.current.ttft;
       const stepEndedTs = props.timestamp;
-      // OpenCode publishes step.ended only after every tool fiber has settled,
-      // so the raw span includes tool execution. Subtract the union of the tool
-      // execution intervals (tool-input generation stays inside the window).
-      const toolBusy = toolBusyMs(prev.current.toolIntervals, t1, stepEndedTs);
-      const decodeTimeSec = (stepEndedTs - t1 - toolBusy) / 1000;
+      // Prefer the v2 `step.streamed` boundary: OpenCode publishes it when the
+      // provider response body ends, before tools settle, so the window needs
+      // no tool subtraction. Without it, fall back to step.ended minus the
+      // union of the tool execution intervals.
+      const streamedTs = prev.current.streamedTs;
+      const decodeTimeSec =
+        streamedTs !== undefined && streamedTs > t1
+          ? (streamedTs - t1) / 1000
+          : (stepEndedTs - t1 - toolBusyMs(prev.current.toolIntervals, t1, stepEndedTs)) / 1000;
 
       const outputTokens =
         (props.tokens?.output ?? 0) + (props.tokens?.reasoning ?? 0);
@@ -609,6 +647,9 @@ export class SpeedCollector {
    * If elapsed <= 0.1s, liveEstimate remains null.
    * While a tool is executing, the previous estimate is frozen so that a
    * growing elapsed time cannot drag chars/s down toward zero.
+   * The estimate is also frozen once the v2 `step.streamed` boundary arrived:
+   * no further deltas can arrive, and the remaining span until step.ended is
+   * tool settlement time that must not dilute the live chars/s.
    * Once every tool interval is closed, the union of those intervals is
    * subtracted from the elapsed time, mirroring `onStepEnded` so the live
    * value cannot regress to counting tool execution as decode time.
@@ -624,7 +665,8 @@ export class SpeedCollector {
       const running = (m.current.toolIntervals ?? []).some(
         (interval) => interval.end === undefined
       );
-      const liveEstimate = running
+      const frozen = running || m.current.streamedTs !== undefined;
+      const liveEstimate = frozen
         ? m.current.liveEstimate
         : (() => {
             const toolBusy = toolBusyMs(m.current.toolIntervals, m.current.t1, now);

@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 
 import { createRoot, createSignal } from "solid-js";
-import type { TuiPluginModule } from "@opencode-ai/plugin/tui";
+import type { TuiPluginModule, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 
 import {
   SpeedCollector,
@@ -37,7 +37,9 @@ function runtimeBun(): BunRuntime | undefined {
   return (globalThis as typeof globalThis & { Bun?: BunRuntime }).Bun;
 }
 
-export const CONFIG_PATH = `${runtimeBun()?.env.HOME ?? ""}/.config/opencode/speed-measure.json`;
+export const CONFIG_PATH = `${
+  runtimeBun()?.env.XDG_CONFIG_HOME ?? `${runtimeBun()?.env.HOME ?? ""}/.config`
+}/opencode/speed-measure.json`;
 const KV_PREFIX = "speed-measure:avg:";
 const FALLBACK_DELAY_MS = 2_000;
 
@@ -256,271 +258,535 @@ function numberFromKV(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-const plugin = {
-  id: "speed-measure.sidebar",
-  tui: async (api) => {
-    const config = await loadConfig();
+// ---------------------------------------------------------------------------
+// OpenCode v2 (>= 2.0) host contract
+// ---------------------------------------------------------------------------
 
-    createRoot((dispose) => {
-      const collector = new SpeedCollector();
-      const [sessionMetrics, setSessionMetrics] = createSignal<CollectorState>(
-        new Map(),
-      );
-      const [cacheReads, setCacheReads] = createSignal<Map<string, number>>(
-        new Map(),
-      );
-      const unsubs: Array<() => void> = [];
-      let v1Unsubs: Array<() => void> = [];
-      let v1Active = false;
+/**
+ * Minimal structural types for the OpenCode v2 TUI plugin host. The v2 host
+ * injects every service at runtime, so only the members below are consumed;
+ * keeping them structural avoids pinning a v2 SDK version for type checking.
+ */
+type Unsubscribe = () => void;
 
-      const update = (
-        transition: (previous: CollectorState) => CollectorState,
-      ) => setSessionMetrics(transition);
+/**
+ * v2 events arrive as `{ type, created, data }`. `created` is the server-side
+ * publish time in ms; payloads carry no timestamps of their own (the only
+ * exception is `session.step.started`, whose `started` is the request
+ * dispatch time before prefill). `data` stays `any` because the payload shape
+ * is duck-typed at this boundary — spreading an index-signature type would
+ * otherwise drop its properties from object literals.
+ */
+export interface V2Event {
+  type: string;
+  created: number;
+  data: any;
+}
 
-      const persistAverages = (sessionID: string, state: CollectorState) => {
-        if (!config.showAverages || !api.kv.ready) return;
-        const averages = calculateSessionAverages(state.get(sessionID));
-        if (!averages) return;
+/** Color token both hosts hand to `fg` (RGBA; same value type as 1.x). */
+type ThemeColor = TuiThemeCurrent["text"];
 
-        api.kv.set(`${KV_PREFIX}${sessionID}:ttft`, averages.ttft);
-        api.kv.set(`${KV_PREFIX}${sessionID}:decode`, averages.decodeTokPerSec);
-        if (averages.prefillTokPerSec !== null) {
-          api.kv.set(
-            `${KV_PREFIX}${sessionID}:prefill`,
-            averages.prefillTokPerSec,
-          );
-        }
-      };
+export interface V2Context {
+  data: {
+    on: (type: string, handler: (event: V2Event) => void) => Unsubscribe;
+  };
+  storage: {
+    memory: <Value extends object>(
+      key: string,
+      options: { initial: Value },
+    ) => readonly [Value, (mutation: (draft: Value) => void) => void];
+  };
+  ui: {
+    slot: (claim: {
+      append: "sidebar.content";
+      render: (input: { sessionID: string }) => unknown;
+    }) => Unsubscribe;
+  };
+  theme: {
+    text: { base: ThemeColor; muted: ThemeColor };
+  };
+}
 
-      const recordStepEnd = (
-        properties: Parameters<SpeedCollector["onStepEnded"]>[1],
-      ) => {
-        if (config.showCache) {
-          setCacheReads((previous) => {
-            const next = new Map(previous);
-            next.set(properties.sessionID, properties.tokens.cache?.read ?? 0);
-            return next;
-          });
-        }
-        update((previous) => {
-          const next = collector.onStepEnded(previous, properties);
-          persistAverages(properties.sessionID, next);
+/**
+ * The sidebar block shared by both host contracts. Every value stays a
+ * function and is read inside the JSX expressions: the Solid universal
+ * transform only registers signal dependencies for reads that happen in
+ * reactive scopes, which is what keeps the live rows and theme colors
+ * updating without re-calling the slot render.
+ */
+function renderSpeedBlock(
+  header: () => ThemeColor,
+  muted: () => ThemeColor,
+  lines: () => DisplayLines,
+) {
+  return (
+    <box flexDirection="column">
+      <text fg={header()}>
+        <b>Speed</b>
+      </text>
+      <text fg={muted()}>{lines().prefill}</text>
+      <text fg={muted()}>{lines().decode}</text>
+    </box>
+  );
+}
+
+/**
+ * OpenCode v2 entry (`{ id, setup }` module contract).
+ *
+ * Subscribes to the v2 event names (`session.step.*`, `session.text.*`,
+ * `session.reasoning.*`, `session.tool.*`). The 1.18.x `session.next.*` names
+ * and the legacy `message.part.*` events no longer exist on v2, so there is
+ * no fallback path here.
+ */
+async function setupV2(context: V2Context): Promise<() => void> {
+  const config = await loadConfig();
+
+  return createRoot((dispose) => {
+    const collector = new SpeedCollector();
+    const [sessionMetrics, setSessionMetrics] = createSignal<CollectorState>(
+      new Map(),
+    );
+    const [cacheReads, setCacheReads] = createSignal<Map<string, number>>(
+      new Map(),
+    );
+    const unsubs: Array<() => void> = [];
+
+    // Session averages live in the host's shared memory store so they survive
+    // plugin hot reloads, mirroring the 1.x api.kv behavior.
+    const [averagesStore, mutateAverages] = context.storage.memory<
+      Record<string, SessionAverages>
+    >("speed-measure:averages", { initial: {} });
+
+    const update = (
+      transition: (previous: CollectorState) => CollectorState,
+    ) => setSessionMetrics(transition);
+
+    const persistAverages = (sessionID: string, state: CollectorState) => {
+      if (!config.showAverages) return;
+      const averages = calculateSessionAverages(state.get(sessionID));
+      if (!averages) return;
+      mutateAverages((draft) => {
+        draft[sessionID] = averages;
+      });
+    };
+
+    const recordStepEnd = (
+      properties: Parameters<SpeedCollector["onStepEnded"]>[1],
+    ) => {
+      if (config.showCache) {
+        setCacheReads((previous) => {
+          const next = new Map(previous);
+          next.set(properties.sessionID, properties.tokens.cache?.read ?? 0);
           return next;
         });
-      };
+      }
+      update((previous) => {
+        const next = collector.onStepEnded(previous, properties);
+        persistAverages(properties.sessionID, next);
+        return next;
+      });
+    };
 
-      const activateV1Fallback = () => {
-        if (v1Active || api.lifecycle.signal.aborted) return;
-        v1Active = true;
+    unsubs.push(
+      context.data.on("session.step.started", (event) =>
+        update((previous) =>
+          collector.onStepStarted(previous, {
+            ...event.data,
+            // `started` is the request dispatch time (before prefill), so the
+            // v2 TTFT no longer collapses to ~0 like the 1.18.x step events.
+            timestamp: event.data.started,
+          }),
+        ),
+      ),
+      context.data.on("session.text.started", (event) =>
+        update((previous) =>
+          collector.onTextStarted(previous, {
+            ...event.data,
+            timestamp: event.created,
+          }),
+        ),
+      ),
+      context.data.on("session.text.delta", (event) =>
+        update((previous) => collector.onTextDelta(previous, event.data)),
+      ),
+      context.data.on("session.reasoning.started", (event) =>
+        update((previous) =>
+          collector.onReasoningStarted(previous, {
+            ...event.data,
+            timestamp: event.created,
+          }),
+        ),
+      ),
+      context.data.on("session.reasoning.delta", (event) =>
+        update((previous) => collector.onReasoningDelta(previous, event.data)),
+      ),
+      context.data.on("session.tool.called", (event) =>
+        update((previous) =>
+          collector.onToolCalled(previous, {
+            ...event.data,
+            // v2 tool payloads identify calls as `id`, not `callID`.
+            callID: event.data.id,
+            timestamp: event.created,
+          }),
+        ),
+      ),
+      context.data.on("session.tool.success", (event) =>
+        update((previous) =>
+          collector.onToolEnded(previous, {
+            ...event.data,
+            callID: event.data.id,
+            timestamp: event.created,
+          }),
+        ),
+      ),
+      context.data.on("session.tool.failed", (event) =>
+        update((previous) =>
+          collector.onToolEnded(previous, {
+            ...event.data,
+            callID: event.data.id,
+            timestamp: event.created,
+          }),
+        ),
+      ),
+      context.data.on("session.step.streamed", (event) =>
+        update((previous) =>
+          collector.onStepStreamed(previous, {
+            sessionID: event.data.sessionID,
+            streamedAt: event.created,
+          }),
+        ),
+      ),
+      context.data.on("session.step.ended", (event) =>
+        recordStepEnd({ ...event.data, timestamp: event.created }),
+      ),
+      context.data.on("session.step.failed", (event) =>
+        update((previous) =>
+          collector.onStepFailed(previous, {
+            ...event.data,
+            timestamp: event.created,
+          }),
+        ),
+      ),
+      context.data.on("session.status", (event) => {
+        if (event.data.status?.type === "idle") {
+          update((previous) =>
+            collector.onIdle(previous, event.data.sessionID),
+          );
+        }
+      }),
+      context.data.on("session.execution.failed", (event) =>
+        update((previous) =>
+          collector.onSessionError(previous, event.data.sessionID),
+        ),
+      ),
+      context.data.on("session.execution.interrupted", (event) =>
+        update((previous) =>
+          collector.onIdle(previous, event.data.sessionID),
+        ),
+      ),
+    );
 
-        v1Unsubs = [
-          api.event.on("message.part.updated", (event) => {
-            const part = event.properties.part;
-            const now = Date.now();
+    const liveTimer = setInterval(
+      () => update((previous) => collector.tick(previous)),
+      config.liveIntervalMs,
+    );
 
-            if (part.type === "step-start") {
-              update((previous) =>
-                collector.onStepStarted(previous, {
-                  sessionID: part.sessionID,
-                  assistantMessageID: part.messageID,
-                  timestamp: now,
-                }),
-              );
-              return;
-            }
+    context.ui.slot({
+      // Claims coexist in plugin enable order; the builtin context block uses
+      // the same anchor, so Speed renders after it. The 1.x `order` config has
+      // no v2 equivalent.
+      append: "sidebar.content",
+      render: (props) => {
+        const lines = () =>
+          buildDisplayLines(sessionMetrics(), props.sessionID, config, {
+            averages: config.showAverages
+              ? averagesStore[props.sessionID]
+              : undefined,
+            cacheRead: cacheReads().get(props.sessionID),
+          });
+        return renderSpeedBlock(
+          () => context.theme.text.base,
+          () => context.theme.text.muted,
+          lines,
+        );
+      },
+    });
 
-            if (part.type === "step-finish") {
-              recordStepEnd({
+    return () => {
+      unsubs.forEach((unsubscribe) => unsubscribe());
+      clearInterval(liveTimer);
+      dispose();
+    };
+  });
+}
+
+/**
+ * OpenCode 1.15–1.x entry (`{ id, tui }` module contract). The v2
+ * `session.step.*` events do not exist there, so the primary path listens on
+ * `session.next.*` and falls back to the legacy `message.part.*` events when
+ * none arrive within two seconds.
+ */
+async function setupLegacy(
+  api: Parameters<TuiPluginModule["tui"]>[0],
+): Promise<void> {
+  const config = await loadConfig();
+
+  createRoot((dispose) => {
+    const collector = new SpeedCollector();
+    const [sessionMetrics, setSessionMetrics] = createSignal<CollectorState>(
+      new Map(),
+    );
+    const [cacheReads, setCacheReads] = createSignal<Map<string, number>>(
+      new Map(),
+    );
+    const unsubs: Array<() => void> = [];
+    let v1Unsubs: Array<() => void> = [];
+    let v1Active = false;
+
+    const update = (
+      transition: (previous: CollectorState) => CollectorState,
+    ) => setSessionMetrics(transition);
+
+    const persistAverages = (sessionID: string, state: CollectorState) => {
+      if (!config.showAverages || !api.kv.ready) return;
+      const averages = calculateSessionAverages(state.get(sessionID));
+      if (!averages) return;
+
+      api.kv.set(`${KV_PREFIX}${sessionID}:ttft`, averages.ttft);
+      api.kv.set(`${KV_PREFIX}${sessionID}:decode`, averages.decodeTokPerSec);
+      if (averages.prefillTokPerSec !== null) {
+        api.kv.set(
+          `${KV_PREFIX}${sessionID}:prefill`,
+          averages.prefillTokPerSec,
+        );
+      }
+    };
+
+    const recordStepEnd = (
+      properties: Parameters<SpeedCollector["onStepEnded"]>[1],
+    ) => {
+      if (config.showCache) {
+        setCacheReads((previous) => {
+          const next = new Map(previous);
+          next.set(properties.sessionID, properties.tokens.cache?.read ?? 0);
+          return next;
+        });
+      }
+      update((previous) => {
+        const next = collector.onStepEnded(previous, properties);
+        persistAverages(properties.sessionID, next);
+        return next;
+      });
+    };
+
+    const activateV1Fallback = () => {
+      if (v1Active || api.lifecycle.signal.aborted) return;
+      v1Active = true;
+
+      v1Unsubs = [
+        api.event.on("message.part.updated", (event) => {
+          const part = event.properties.part;
+          const now = Date.now();
+
+          if (part.type === "step-start") {
+            update((previous) =>
+              collector.onStepStarted(previous, {
                 sessionID: part.sessionID,
                 assistantMessageID: part.messageID,
                 timestamp: now,
-                tokens: part.tokens,
-              });
-              return;
-            }
-
-            if (part.type === "tool") {
-              // Runtime payloads may omit `state` entirely, so read it defensively.
-              const toolState = part.state as
-                | { time?: { start?: number; end?: number } }
-                | undefined;
-              const toolTime = toolState?.time;
-              const sessionID = part.sessionID;
-              const callID = part.callID;
-              if (toolTime && typeof toolTime.start === "number") {
-                const timestamp = toolTime.start;
-                update((previous) =>
-                  collector.onToolCalled(previous, {
-                    sessionID,
-                    callID,
-                    timestamp,
-                  }),
-                );
-              }
-              if (toolTime && typeof toolTime.end === "number") {
-                const timestamp = toolTime.end;
-                update((previous) =>
-                  collector.onToolEnded(previous, {
-                    sessionID,
-                    callID,
-                    timestamp,
-                  }),
-                );
-              }
-            }
-          }),
-          api.event.on("message.part.delta", (event) => {
-            if (event.properties.field !== "text") return;
-            const { sessionID, messageID, delta } = event.properties;
-            update((previous) => {
-              let next = previous;
-              if (previous.get(sessionID)?.current.phase === "prefilling") {
-                next = collector.onTextStarted(previous, {
-                  sessionID,
-                  assistantMessageID: messageID,
-                  timestamp: Date.now(),
-                });
-              }
-              return collector.onTextDelta(next, { sessionID, delta });
-            });
-          }),
-        ];
-      };
-
-      const fallback = scheduleV1Fallback(activateV1Fallback);
-      const selectV2 = () => {
-        fallback.markV2Seen();
-        if (!v1Active) return;
-        v1Active = false;
-        v1Unsubs.forEach((unsubscribe) => unsubscribe());
-        v1Unsubs = [];
-      };
-
-      unsubs.push(
-        api.event.on("session.next.step.started", (event) => {
-          selectV2();
-          update((previous) =>
-            collector.onStepStarted(previous, event.properties),
-          );
-        }),
-        api.event.on("session.next.reasoning.started", (event) =>
-          update((previous) =>
-            collector.onReasoningStarted(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.next.reasoning.delta", (event) =>
-          update((previous) =>
-            collector.onReasoningDelta(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.next.text.started", (event) =>
-          update((previous) =>
-            collector.onTextStarted(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.next.text.delta", (event) =>
-          update((previous) =>
-            collector.onTextDelta(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.next.tool.called", (event) =>
-          update((previous) =>
-            collector.onToolCalled(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.next.tool.success", (event) =>
-          update((previous) =>
-            collector.onToolEnded(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.next.tool.failed", (event) =>
-          update((previous) =>
-            collector.onToolEnded(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.next.step.ended", (event) =>
-          recordStepEnd(event.properties),
-        ),
-        api.event.on("session.next.step.failed", (event) =>
-          update((previous) =>
-            collector.onStepFailed(previous, event.properties),
-          ),
-        ),
-        api.event.on("session.status", (event) => {
-          if (event.properties.status.type === "idle") {
-            update((previous) =>
-              collector.onIdle(previous, event.properties.sessionID),
+              }),
             );
+            return;
+          }
+
+          if (part.type === "step-finish") {
+            recordStepEnd({
+              sessionID: part.sessionID,
+              assistantMessageID: part.messageID,
+              timestamp: now,
+              tokens: part.tokens,
+            });
+            return;
+          }
+
+          if (part.type === "tool") {
+            // Runtime payloads may omit `state` entirely, so read it defensively.
+            const toolState = part.state as
+              | { time?: { start?: number; end?: number } }
+              | undefined;
+            const toolTime = toolState?.time;
+            const sessionID = part.sessionID;
+            const callID = part.callID;
+            if (toolTime && typeof toolTime.start === "number") {
+              const timestamp = toolTime.start;
+              update((previous) =>
+                collector.onToolCalled(previous, {
+                  sessionID,
+                  callID,
+                  timestamp,
+                }),
+              );
+            }
+            if (toolTime && typeof toolTime.end === "number") {
+              const timestamp = toolTime.end;
+              update((previous) =>
+                collector.onToolEnded(previous, {
+                  sessionID,
+                  callID,
+                  timestamp,
+                }),
+              );
+            }
           }
         }),
-        api.event.on("session.error", (event) =>
+        api.event.on("message.part.delta", (event) => {
+          if (event.properties.field !== "text") return;
+          const { sessionID, messageID, delta } = event.properties;
+          update((previous) => {
+            let next = previous;
+            if (previous.get(sessionID)?.current.phase === "prefilling") {
+              next = collector.onTextStarted(previous, {
+                sessionID,
+                assistantMessageID: messageID,
+                timestamp: Date.now(),
+              });
+            }
+            return collector.onTextDelta(next, { sessionID, delta });
+          });
+        }),
+      ];
+    };
+
+    const fallback = scheduleV1Fallback(activateV1Fallback);
+    const selectV2 = () => {
+      fallback.markV2Seen();
+      if (!v1Active) return;
+      v1Active = false;
+      v1Unsubs.forEach((unsubscribe) => unsubscribe());
+      v1Unsubs = [];
+    };
+
+    unsubs.push(
+      api.event.on("session.next.step.started", (event) => {
+        selectV2();
+        update((previous) =>
+          collector.onStepStarted(previous, event.properties),
+        );
+      }),
+      api.event.on("session.next.reasoning.started", (event) =>
+        update((previous) =>
+          collector.onReasoningStarted(previous, event.properties),
+        ),
+      ),
+      api.event.on("session.next.reasoning.delta", (event) =>
+        update((previous) =>
+          collector.onReasoningDelta(previous, event.properties),
+        ),
+      ),
+      api.event.on("session.next.text.started", (event) =>
+        update((previous) =>
+          collector.onTextStarted(previous, event.properties),
+        ),
+      ),
+      api.event.on("session.next.text.delta", (event) =>
+        update((previous) => collector.onTextDelta(previous, event.properties)),
+      ),
+      api.event.on("session.next.tool.called", (event) =>
+        update((previous) => collector.onToolCalled(previous, event.properties)),
+      ),
+      api.event.on("session.next.tool.success", (event) =>
+        update((previous) => collector.onToolEnded(previous, event.properties)),
+      ),
+      api.event.on("session.next.tool.failed", (event) =>
+        update((previous) => collector.onToolEnded(previous, event.properties)),
+      ),
+      api.event.on("session.next.step.ended", (event) =>
+        recordStepEnd(event.properties),
+      ),
+      api.event.on("session.next.step.failed", (event) =>
+        update((previous) =>
+          collector.onStepFailed(previous, event.properties),
+        ),
+      ),
+      api.event.on("session.status", (event) => {
+        if (event.properties.status.type === "idle") {
           update((previous) =>
-            collector.onSessionError(
-              previous,
-              event.properties.sessionID ?? null,
-            ),
+            collector.onIdle(previous, event.properties.sessionID),
+          );
+        }
+      }),
+      api.event.on("session.error", (event) =>
+        update((previous) =>
+          collector.onSessionError(
+            previous,
+            event.properties.sessionID ?? null,
           ),
         ),
-      );
+      ),
+    );
 
-      const liveTimer = setInterval(
-        () => update((previous) => collector.tick(previous)),
-        config.liveIntervalMs,
-      );
+    const liveTimer = setInterval(
+      () => update((previous) => collector.tick(previous)),
+      config.liveIntervalMs,
+    );
 
-      api.slots.register({
-        order: config.order,
-        slots: {
-          sidebar_content(ctx, props) {
-            const theme = () => ctx.theme.current;
-            const persistedAverages = (): SessionAverages | undefined => {
-              if (!config.showAverages || !api.kv.ready) return undefined;
-              const ttft = numberFromKV(
-                api.kv.get(`${KV_PREFIX}${props.session_id}:ttft`),
-              );
-              const decodeTokPerSec = numberFromKV(
-                api.kv.get(`${KV_PREFIX}${props.session_id}:decode`),
-              );
-              if (ttft === undefined || decodeTokPerSec === undefined) {
-                return undefined;
-              }
-              return {
-                ttft,
-                decodeTokPerSec,
-                prefillTokPerSec:
-                  numberFromKV(
-                    api.kv.get(`${KV_PREFIX}${props.session_id}:prefill`),
-                  ) ?? null,
-              };
-            };
-            const lines = () =>
-              buildDisplayLines(sessionMetrics(), props.session_id, config, {
-                averages: persistedAverages(),
-                cacheRead: cacheReads().get(props.session_id),
-              });
-
-            return (
-              <box flexDirection="column">
-                <text fg={theme().text}>
-                  <b>Speed</b>
-                </text>
-                <text fg={theme().textMuted}>{lines().prefill}</text>
-                <text fg={theme().textMuted}>{lines().decode}</text>
-              </box>
+    api.slots.register({
+      order: config.order,
+      slots: {
+        sidebar_content(ctx, props) {
+          const persistedAverages = (): SessionAverages | undefined => {
+            if (!config.showAverages || !api.kv.ready) return undefined;
+            const ttft = numberFromKV(
+              api.kv.get(`${KV_PREFIX}${props.session_id}:ttft`),
             );
-          },
-        },
-      });
+            const decodeTokPerSec = numberFromKV(
+              api.kv.get(`${KV_PREFIX}${props.session_id}:decode`),
+            );
+            if (ttft === undefined || decodeTokPerSec === undefined) {
+              return undefined;
+            }
+            return {
+              ttft,
+              decodeTokPerSec,
+              prefillTokPerSec:
+                numberFromKV(
+                  api.kv.get(`${KV_PREFIX}${props.session_id}:prefill`),
+                ) ?? null,
+            };
+          };
+          const lines = () =>
+            buildDisplayLines(sessionMetrics(), props.session_id, config, {
+              averages: persistedAverages(),
+              cacheRead: cacheReads().get(props.session_id),
+            });
 
-      api.lifecycle.onDispose(() => {
-        fallback.dispose();
-        v1Unsubs.forEach((unsubscribe) => unsubscribe());
-        unsubs.forEach((unsubscribe) => unsubscribe());
-        clearInterval(liveTimer);
-        dispose();
-      });
+          return renderSpeedBlock(
+            () => ctx.theme.current.text,
+            () => ctx.theme.current.textMuted,
+            lines,
+          );
+        },
+      },
     });
-  },
-} satisfies TuiPluginModule;
+
+    api.lifecycle.onDispose(() => {
+      fallback.dispose();
+      v1Unsubs.forEach((unsubscribe) => unsubscribe());
+      unsubs.forEach((unsubscribe) => unsubscribe());
+      clearInterval(liveTimer);
+      dispose();
+    });
+  });
+}
+
+const plugin = {
+  id: "speed-measure.sidebar",
+  /** OpenCode v2 (>= 2.0): the host requires `{ id, setup }` modules. */
+  setup: (context: V2Context) => setupV2(context),
+  /** OpenCode 1.15–1.x: the host requires `{ id, tui }` modules. */
+  tui: async (api: Parameters<TuiPluginModule["tui"]>[0]) => setupLegacy(api),
+} satisfies TuiPluginModule & {
+  setup: (context: V2Context) => Promise<void | (() => void)>;
+};
 
 export default plugin;

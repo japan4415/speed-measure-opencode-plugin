@@ -93,6 +93,8 @@ speed-measure-opencode-plugin/
 ├── test/
 │   ├── collector.test.ts
 │   ├── format.test.ts
+│   ├── index.test.tsx       # 1.x エントリ（plugin.tui）
+│   ├── index-v2.test.tsx    # v2 エントリ（plugin.setup）
 │   └── fixtures/        # 実 vLLM セッションから記録したイベント列 JSON
 │       ├── simple-text.json
 │       ├── tool-call.json
@@ -774,6 +776,7 @@ vLLM サーバーは `http://172-25-4-137.tailcd0071.ts.net:8888/v1` で稼働�
   - このため v2 では `t0`（`session.next.step.started`）と `t1`（first token）がほぼ同時刻になり TTFT ≈ 0 になる。
   - v1 経路では `step-start` part が真の開始なので TTFT は正常に計測できる。実 DB（`~/.local/share/opencode/opencode.db`）で全 step の step-start part の `time_created` と、その step 内で最初に現れる text/reasoning part の `time.start` の差を集計すると `n=1416, min=0, p25=2, p50=7, mean=260, p75=502, max=1476`（ms）であり、中央値 7 ms で `step-start` は first token より前に来る（負値なし）。
   - §1.1 の前提（`t0` = step 開始）と矛盾する。**別 Issue として扱う（今回は未修正）。**
+  - **追記（OpenCode 2.x）**: 2.x の `session.step.started` はペイロードに `started`（リクエスト dispatch 時刻、プリフィル前）を持つ。§10.3 のとおり v2 エントリはこの値を `t0` に使うため、**2.x では本問題は発生しない**。1.18.x の `session.next.*` 経路では引き続き発生する。
 - **v1 fallback では decode 窓の両端とツール区間で時刻ソースが混在する**
   - `src/index.tsx:319` の `const now = Date.now()` がクライアント時刻であり、`step-start`（:322-328）と `step-finish`（:332-337）へ渡される。`t1`（first token）も `message.part.delta` 受信時の `Date.now()`（`src/index.tsx:381`）である。
   - 一方ツール区間は `src/index.tsx:350-366` で tool part の `state.time.start` / `state.time.end` を無変換で `onToolCalled` / `onToolEnded` へ渡す。これは §3.2 のとおりクライアントの `Date.now()` ではなく SDK が記録したサーバー時刻である。
@@ -783,10 +786,84 @@ vLLM サーバーは `http://172-25-4-137.tailcd0071.ts.net:8888/v1` で稼働�
   - 誤差の顕在化は時計ずれに限らない。**両者の時計が完全に同期していても、配送遅延の差だけで誤差が生じる。** 再現例: サーバー基準で first token `12,500`、tool `13,000..73,000`、step-finish `73,150` のとき、クライアント受信が first delta `15,000`（2,500 ms 遅延）・step-finish `74,150`（1,000 ms 遅延）になると実装の出力は **43.478 tok/s**（`decodeTokPerSec = 43.47826086956522`）となり、サーバー基準の期待値 `50 / (60,650 - 60,000) ms` = **76.923 tok/s** を下回る。
   - 誤差の大きさは「窓の両端の配送遅延の差」に比例する。同一マシンのローカル利用では通常ミリ秒オーダーで影響は小さいが、**ゼロではない**。時計が大きくずれる場合（別マシン構成など）は、上記のとおり部分減算または完全脱落として誤差が大きくなる。
   - **v2 経路はこの問題の影響を受けない。** v2 は窓の両端もツール区間もすべて `session.next.*` イベントの `timestamp`（同一ソース）を使う。
+  - **追記（OpenCode 2.x）**: 2.x では `message.part.*` が発行されないため v1 fallback は 1.18.x でのみ活性化する。2.x エントリ（§10）は窓の両端もツール区間もサーバー時刻（envelope `created` と `step.streamed` 境界）で統一されるため、本問題の影響を受けない。
   - 将来解消する場合の選択肢: (a) v1 の窓の両端も part のサーバー時刻から取る（TTFT / prefill の計測にも波及するため要注意）、(b) ツール区間もクライアント時刻に揃える（配送遅延の分だけ精度が落ちる）。どちらを採るかは未決定。
 - **v2 では continuation ごとに `assistantMessageID` が変わりうる**
   - collector は `assistantMessageID` の変化で `stepHistory` をリセットする（`src/collector.ts` の `onStepStarted` 内、215 行目付近）。
   - このため平均値表示（`showAverages: true`）が step をまたげない可能性がある。未検証。
+
+---
+
+## 10. OpenCode v2 (2.x) 対応
+
+OpenCode 2.0 で TUI プラグイン API とイベント名が刷新されたため、本プラグインは 1 つの default export で両世代のホスト契約を満たす。
+
+### 10.1 モジュール契約
+
+- v2 ホスト（`packages/tui/src/plugin/context.tsx` の `isPlugin`）は default export に対し `{ id: string, setup: Function }` を検証し、`setup(context)` を呼ぶ。`setup` が cleanup 関数を返すとホストが deactivate / TUI 終了時に呼ぶ（1.x の `api.lifecycle.onDispose` の代替）。
+- 1.x ホストは `{ id, tui }` を読み `tui(api)` を呼ぶ。
+- default export は両キーを持つ。各ホストは自分のキーだけを読むため、片方が他方のキーや 1.18.30 型の `TuiPluginModule` に無いフィールドを拒否することはない。
+- エントリポイントは `exports["./tui"]` であり、v2 の `Host.resolve().tui` も同じ subpath を解決するため変更不要。
+
+### 10.2 v2 イベントマッピング
+
+v2 のイベントは `{ type, created, data }` 形で届く。`created` はサーバー側 publish 時刻（ms）。ペイロード自身は `session.step.started` の `started` を除いて時刻フィールドを持たない。
+
+| v2 イベント | collector 呼び出し | 時刻ソース |
+|---|---|---|
+| `session.step.started` | `onStepStarted` | ペイロード `started`（リクエスト dispatch 時刻、プリフィル前） |
+| `session.text.started` / `session.reasoning.started` | `onTextStarted` / `onReasoningStarted` | envelope `created` |
+| `session.text.delta` / `session.reasoning.delta` | `onTextDelta` / `onReasoningDelta` | — |
+| `session.tool.called` | `onToolCalled` | envelope `created`（callID は `data.id`） |
+| `session.tool.success` / `session.tool.failed` | `onToolEnded` | envelope `created`（callID は `data.id`） |
+| `session.step.streamed` | `onStepStreamed` | envelope `created` |
+| `session.step.ended` | `onStepEnded` | envelope `created` |
+| `session.step.failed` | `onStepFailed` | envelope `created` |
+| `session.status`（idle） | `onIdle` | — |
+| `session.execution.failed` | `onSessionError` | — |
+| `session.execution.interrupted` | `onIdle` | — |
+
+1.18.x の `session.next.*` プレフィックスは 2.x で廃止され、`message.part.*` も 2.x では発行されない。このため **v2 エントリにフォールバック経路は存在しない**。1.x エントリは従来どおり `session.next.*` 主経路 + `message.part.*` フォールバック（§3.2）を使う。
+
+### 10.3 decode 窓の境界（`session.step.streamed`）
+
+v2 の `session.step.streamed` は「provider レスポンス本体の終了時刻、ツール決着前」を記録する durable イベントである（`packages/schema/src/session-event.ts`）。collector はこれを `DecodingState.streamedTs` に記録し、`onStepEnded` で次を適用する:
+
+- `streamedTs > t1` のとき decode 窓 = `[t1, streamedTs]`。ツール実行はこの境界の後に決着するため `toolBusyMs` の減算は行わない
+- 境界が無い、または `streamedTs <= t1` のときは従来どおり `[t1, step.ended] − tool_busy`（1.x 経路と同一の式）
+- `tick` は `streamedTs` 到着後のライブ推定を凍結する。境界以降 delta は来ず、`step.ended` までの残り時間はツール決着待ちであり、これを分母に含めると chars/s が希釈される
+
+### 10.4 描画と状態
+
+- slot: `context.ui.slot({ append: "sidebar.content", render })`。builtin の `opencode.sidebar.context` と同じ anchor であり、複数 claim はプラグイン有効順に並ぶため **`order` 設定は v2 では無視される**
+- テーマ: `context.theme.text.base` / `context.theme.text.muted`（1.x は `ctx.theme.current.text` / `.textMuted`）。両者とも値は `RGBA` で同一の型
+- 平均値の保持: `context.storage.memory("speed-measure:averages")`。hot reload を跨いで生存し、1.x の `api.kv` と同等の寿命をもつ（v2 に `api.kv` は存在しない）
+- 設定ファイル `speed-measure.json` の読み込みは Bun ランタイム依存のまま両世代で共通。パスは `XDG_CONFIG_HOME` を優先し、未設定時は `$HOME/.config/opencode/speed-measure.json`
+- テスト: `test/index-v2.test.tsx`（v2 エントリ）、`test/collector.test.ts` の `session.step.streamed boundary (v2)` ブロック
+
+### 10.5 v2 におけるローカルプラグインの読み込み
+
+実機検証（OpenCode 2.0.18）で確認した v2 のローダー仕様:
+
+- v2 の TUI 設定ファイルは `~/.config/opencode/cli.json`（1.x の `tui.jsonc` は廃止）。`plugins` 配列にローカルパス / npm spec を並べる
+- ローカルエントリは `localSource` で `file://` URL に解決され、**単一ファイルは `stat().isFile()` の時点で黙ってスキップされる**。ディレクトリ（または plugins ディレクトリ内のディレクトリ / シンボリックリンク）のみが対象
+- ディレクトリは `Host.resolve` により `<ディレクトリ>/tui` を **`Bun.resolveSync` のリテラルパスとして**解決する。`package.json` の `exports` マップは名前付きパッケージ解決（npm インストール後の `<name>/tui`）でのみ効き、絶対パス指定では適用されない（実測: `ERR_MODULE_NOT_FOUND`）
+- このためリポジトリにはリテラルエントリ `tui.js`（`dist/index.js` の再エクスポート）を置いてある。npm 公開物は `files: ["dist"]` により `tui.js` を含まず、`exports["./tui"]` で解決される
+- 設定ミス（ファイル指定など）による unsupported はトーストも `/plugins` にも表示されず無音のため、ロードされない場合は `cli.json` の形式と `--log-level debug` の `stage=read` / `entrypoint=` ログを確認する
+
+### 10.6 実機検証結果（OpenCode 2.0.18 / ローカル vLLM）
+
+分離環境（`XDG_CONFIG_HOME` / `OPENCODE_CONFIG_DIR` 系の XDG リダイレクト + tmux）で確認:
+
+- `{ id, setup }` モジュールとしてロードされ、`sidebar.content` への claim で builtin `Context` ブロックの後に Speed ブロックが描画される
+- コールド vLLM で `Prefill: 12446 ms │ 710.4 tok/s`（TTFT はリクエスト dispatch 時刻起点で正常に計測できる）
+- ストリーミング中は `Decode: ~203.1 chars/s` がライブ更新され、完了後 `Decode: 68.5 tok/s` へ切替
+- ツール呼び出しを含むターンでは継続ステップ（新しい `assistantMessageID`）の値が主表示される（§9 の平均値の既知問題どおり、履歴は assistantMessageID 単位でリセットされる）
+- `showAverages: true` で `(avg ...)` 併記、`session.tps: false` と独立に動作
+
+### 10.7 組込み tok/s 表示との差分
+
+OpenCode 2.x は応答フッターに組込みの tok/s 表示（`session.tps`、デフォルト ON）を持つ。`turnTokensPerSecond`（`packages/tui/src/routes/session/rows.ts`）は分母にステップ開始からの総時間（プリフィルを含む `time.streamed − time.created`）を使い、ターン内全ステップを稼働時間で重み付けした平均を返す。本プラグインの Decode 速度は first token 以降の生成フェーズのみを分母とするため、同じステップでも組込み表示の方が常に低く、TTFT が大きいほど差が開く。
 
 ---
 

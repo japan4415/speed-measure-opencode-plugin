@@ -2659,4 +2659,91 @@ describe("SpeedCollector", () => {
       );
     });
   });
+
+  describe("session.step.streamed boundary (v2)", () => {
+    it("ends the decode window at the streamed boundary without tool subtraction", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+      state = collector.onTextStarted(state, ev.textStarted(1340));
+      state = collector.onToolCalled(state, ev.toolCalled("call-1", 1400));
+      state = collector.onToolEnded(state, ev.toolSucceeded("call-1", 2200));
+      state = collector.onStepStreamed(state, {
+        sessionID: "s1",
+        streamedAt: 2300,
+      });
+      // step.ended arrives late, after tool settlement; the streamed boundary wins
+      state = collector.onStepEnded(state, ev.stepEnded(2500, 96));
+
+      const done = state.get("s1")!.current as DoneState;
+      expect(done.phase).toBe("done");
+      // 96 tokens / ((2300 - 1340) / 1000) = 100 tok/s; tool busy (800 ms) is
+      // outside the streamed window and must not be subtracted again.
+      expect(done.decodeTokPerSec).toBeCloseTo(100.0);
+    });
+
+    it("falls back to step.ended minus tool intervals when streamed never arrives", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+      state = collector.onTextStarted(state, ev.textStarted(1340));
+      state = collector.onToolCalled(state, ev.toolCalled("call-1", 1400));
+      state = collector.onToolEnded(state, ev.toolSucceeded("call-1", 2200));
+      state = collector.onStepEnded(state, ev.stepEnded(2500, 96));
+
+      const done = state.get("s1")!.current as DoneState;
+      // (2500 - 1340 - 800) ms → 96 / 0.36
+      expect(done.decodeTokPerSec).toBeCloseTo(266.6667, 3);
+    });
+
+    it("falls back when the streamed boundary precedes the first token", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 1000));
+      state = collector.onTextStarted(state, ev.textStarted(1340));
+      state = collector.onStepStreamed(state, {
+        sessionID: "s1",
+        streamedAt: 1200,
+      });
+      state = collector.onStepEnded(state, ev.stepEnded(2500, 96));
+
+      const done = state.get("s1")!.current as DoneState;
+      // streamedTs <= t1 cannot bound a decode window, so the raw span applies
+      expect(done.decodeTokPerSec).toBeCloseTo(96 / 1.16, 3);
+    });
+
+    it("ignores the streamed boundary while prefilling", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onStepStreamed(state, {
+        sessionID: "s1",
+        streamedAt: 500,
+      });
+      state = collector.onStepEnded(state, ev.stepEnded(1000, 0));
+
+      // A step without a first token records no decode value at all.
+      expect(state.get("s1")!.current).toEqual({ phase: "idle" });
+    });
+
+    it("freezes the live estimate after the streamed boundary", () => {
+      const collector = new SpeedCollector();
+      let state = collector.onStepStarted(new Map(), ev.stepStarted("s1", 0));
+      state = collector.onTextStarted(state, ev.textStarted(500));
+      state = collector.onTextDelta(state, ev.textDelta("a".repeat(150)));
+
+      // `now` is passed explicitly, so no timer mocking is needed.
+      const before = collector.tick(state, 2000);
+      const beforeEstimate = (before.get("s1")!.current as any).liveEstimate;
+      expect(beforeEstimate).toBeCloseTo(150 / 1.5, 3);
+
+      state = collector.onStepStreamed(before, {
+        sessionID: "s1",
+        streamedAt: 2100,
+      });
+      // Without the boundary the growing span until step.ended would dilute
+      // the estimate; with it the last live value holds until step.ended.
+      const after = collector.tick(state, 9000);
+      expect((after.get("s1")!.current as any).liveEstimate).toBeCloseTo(
+        beforeEstimate,
+        6
+      );
+    });
+  });
 });
